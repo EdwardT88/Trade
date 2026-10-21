@@ -1,30 +1,39 @@
-"""Swing pullback-in-trend for XAUUSD (research module, see results/swing_pullback_dev.md).
+"""Swing pullback-in-trend for XAUUSD (research module; full log in results/swing_pullback_dev.md).
+
+RESEARCH RESULT: MARGINAL / UNPROVEN CANDIDATE. Positive after spread + 5%/yr swap on dev 2022-2023
+(+0.55 R/trade, n=69, SE 0.17, in-sample after ~39 combos) and on 2024 (+0.27 R/trade, n=45, SE 0.23,
+t ~ 1.1, not significant alone). Only ~3-4 trades/month. Longs carry it (dev +0.85, 2024 +0.63);
+shorts were +0.23 on dev but -0.46 on 2024 (15 trades). In 2024 the RSI pullback timing did NOT beat
+random entries in the trend direction with the same exits (random +0.20 R, p = 0.33), so most of the
+2024 profit came from "H4 trend + hold until Friday" in a strongly trending gold year.
 
 Idea: trade only in the direction of the H4 trend, buy dips / sell rallies on H1, hold for days
-behind an ATR stop and an ATR trailing stop, never longer than max_hold_days.
+behind an ATR stop and an ATR trailing stop, flat every Friday 20:00 UTC.
+
+Final rules (DEFAULT_PARAMS):
+  trend    H4 bars, last completed bar: long  if close > EMA(40) and EMA(40) > EMA(40) 6 bars ago
+                                         short if close < EMA(40) and EMA(40) < EMA(40) 6 bars ago
+  entry    on the close of an H1 bar: long when RSI(14) crosses back up through 40
+           (RSI[prev] < 40 <= RSI[now]); short when it crosses down through 60. Fill at the next open.
+  stop     2.0 * ATR(14) of the last completed H4 bar (ATR = SMA of true range, MT5 iATR), fixed $ at entry
+  trailing chandelier with a fixed $ distance set at entry: every M1 bar,
+           stop = max(stop, highest bid since entry - 3.0 * ATR_H4_at_entry)   (mirror for shorts, ask lows);
+           it only starts tightening once price is 1 ATR (0.5 R) in profit and never loosens
+  time     close all at Friday 20:00 UTC (or at the last bar before an earlier market close);
+           max hold 10 calendar days (never binding with the Friday close)
+  filters  no new entries Friday >= 12:00 UTC; no fills 21:00-23:59 UTC (rollover / reopen spreads);
+           one position at a time (signals while in a position are ignored); no TP, no breakeven
 
 Conventions (same as strategies/example_ema_pullback.py):
-- every indicator is computed on completed bars only (bars are UTC-aligned, labelled by open time)
+- every indicator is computed on completed bars only (bars are UTC-aligned, labelled by open time;
+  shifting the H4 grid by 2 h to mimic GMT+2 servers changes little: +0.54 vs +0.55 R on dev)
 - a signal decided on an H1 bar's close fills at the open of the first M1 bar at/after that close;
   if that bar is more than 5 min late (daily break / weekend / data hole) the signal is dropped
 - distances (sl / trail) are $ from the fill price, expressed as multiples of ATR at the signal
 
-Rules (defaults in DEFAULT_PARAMS):
-  trend   (H4, last completed bar): long  if close > EMA(trend_len) and EMA rising over slope_bars bars
-                                    short if close < EMA(trend_len) and EMA falling over slope_bars bars
-  pullback trigger (H1 close), pb_mode:
-     'rsi'  long when RSI(rsi_len) crosses back up through rsi_lo (prev < rsi_lo <= now);
-            short when it crosses down through 100 - rsi_lo
-     'ema'  long when some bar of the last pb_bars H1 bars traded at/below EMA(fast) and the current
-            bar closes above EMA(fast) and above the previous bar's high (mirror for shorts)
-  stop     sl_atr * ATR(atr_len) of the last completed atr_tf bar, fixed at entry
-  trailing chandelier: once the best price since entry is trail_start_r * stop beyond the fill,
-           stop = max(stop, best_price - trail_atr * ATR_at_entry), updated every M1 bar
-           (trail_start_r = 0: trailing from the first bar; the stop never loosens)
-  breakeven optional: be_r > 0 moves the stop to fill + be_off_r * stop once +be_r R is reached
-  time     close at max_hold_days after entry; friday_close=True also closes everything at
-           Friday fri_close_utc:00 UTC and takes no new entries on Friday at/after fri_last_entry_utc
-  filters  no fills in skip_hours_utc (daily rollover, wide spreads); cooldown_h between signals
+Research-only options kept for reproducibility: pb_mode 'ema' (EMA-touch pullback; weak, +0.09 R) and
+'none' (benchmark: enter whenever flat in the trend direction), sl_mode 'swing', be_r, tp_r, sides,
+friday_close=False (weekend hold), htf_offset_h.
 """
 import numpy as np
 import pandas as pd
@@ -34,12 +43,12 @@ from backtest.engine import Signals, align_htf_to_m1, htf_close_to_m1_entry, ns
 from backtest.indicators import atr, ema, rsi
 
 DEFAULT_PARAMS = dict(
-    trend_tf="4h", trend_len=50, slope_bars=6,
+    trend_tf="4h", trend_len=40, slope_bars=6,
     entry_tf="1h", pb_mode="rsi", rsi_len=14, rsi_lo=40, fast=20, pb_bars=5,
-    atr_tf="4h", atr_len=14, sl_atr=2.0,
+    atr_tf="4h", atr_len=14, sl_mode="atr", sl_atr=2.0, swing_bars=10, sl_min_atr=1.0,
     trail_atr=3.0, trail_start_r=0.0, be_r=0.0, be_off_r=0.1, tp_r=0.0,
     max_hold_days=10, friday_close=True, fri_close_utc=20, fri_last_entry_utc=12,
-    skip_hours_utc=(21, 22, 23), cooldown_h=0, sides="both", htf_offset_h=0,
+    skip_hours_utc=(21, 22, 23), sides="both", htf_offset_h=0,
 )
 
 _NS_MIN = 60 * 10**9
@@ -54,21 +63,12 @@ def _resample(m1, rule, offset_h):
     return agg
 
 
-def _next_true_after(cond_times_ns: np.ndarray, t_ns: np.ndarray) -> np.ndarray:
-    """For each t, the first time in the sorted array cond_times_ns strictly after t (int64 max if none)."""
-    pos = np.searchsorted(cond_times_ns, t_ns, side="right")
-    out = np.full(len(t_ns), np.iinfo(np.int64).max, dtype=np.int64)
-    ok = pos < len(cond_times_ns)
-    out[ok] = cond_times_ns[pos[ok]]
-    return out
-
-
-def generate_signals(m1: pd.DataFrame, trend_tf="4h", trend_len=50, slope_bars=6,
+def generate_signals(m1: pd.DataFrame, trend_tf="4h", trend_len=40, slope_bars=6,
                      entry_tf="1h", pb_mode="rsi", rsi_len=14, rsi_lo=40, fast=20, pb_bars=5,
-                     atr_tf="4h", atr_len=14, sl_atr=2.0,
+                     atr_tf="4h", atr_len=14, sl_mode="atr", sl_atr=2.0, swing_bars=10, sl_min_atr=1.0,
                      trail_atr=3.0, trail_start_r=0.0, be_r=0.0, be_off_r=0.1, tp_r=0.0,
                      max_hold_days=10, friday_close=True, fri_close_utc=20, fri_last_entry_utc=12,
-                     skip_hours_utc=(21, 22, 23), cooldown_h=0, sides="both", htf_offset_h=0) -> Signals:
+                     skip_hours_utc=(21, 22, 23), sides="both", htf_offset_h=0) -> Signals:
     eb = resample(m1, entry_tf)
     o, h, l, c = (eb[k].to_numpy() for k in ("open", "high", "low", "close"))
     close_t = pd.DatetimeIndex(eb.index + pd.Timedelta(entry_tf))  # time at which the entry bar is complete
@@ -131,19 +131,19 @@ def generate_signals(m1: pd.DataFrame, trend_tf="4h", trend_len=50, slope_bars=6
     # fill right after the signal bar only, and never inside the rollover / reopen hours
     ok = (t_m1[entry] - ns(close_t[cand]) <= 5 * _NS_MIN) & ~np.isin(m1.index[entry].hour, skip_hours_utc)
     cand, entry = cand[ok], entry[ok]
-    if cooldown_h > 0 and len(cand):
-        keep = np.zeros(len(cand), bool)
-        last = -np.inf
-        te = t_m1[entry]
-        for k in range(len(cand)):
-            if te[k] - last >= cooldown_h * 60 * _NS_MIN:
-                keep[k] = True
-                last = te[k]
-        cand, entry = cand[keep], entry[keep]
 
     direction = np.where(up[cand], 1, -1)
     av = a[cand]
-    sl = sl_atr * av
+    if sl_mode == "atr":
+        sl = sl_atr * av
+    elif sl_mode == "swing":
+        # beyond the extreme of the last swing_bars entry bars plus 0.5 ATR, clipped to [sl_min_atr, sl_atr] ATR
+        lo_n = pd.Series(l).rolling(swing_bars).min().to_numpy()[cand]
+        hi_n = pd.Series(h).rolling(swing_bars).max().to_numpy()[cand]
+        dist = np.where(direction > 0, c[cand] - lo_n, hi_n - c[cand]) + 0.5 * av
+        sl = np.clip(dist, sl_min_atr * av, sl_atr * av)
+    else:
+        raise ValueError(sl_mode)
 
     # --- exit time: max hold, and optionally Friday close
     t_entry = t_m1[entry]

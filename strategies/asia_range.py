@@ -1,17 +1,24 @@
 """Asian-range play around the London open (intraday XAUUSD scalper).
 
-Draft under research -- see results/asia_range_dev.md for the log.
+RESEARCH STATUS: NOT VIABLE -- no robust edge after costs (see results/asia_range_dev.md).
 
-Two setups on the range built during the Asian session (true-UTC Tokyo hours up to the London open):
-- "bo"   breakout continuation: first completed M5 close beyond the range (+ buffer) after the London open
-- "fade" liquidity sweep / false breakout: price trades beyond the range, then an M5 bar closes back
-         inside -> trade back into the range, stop beyond the sweep extreme.
+Range: high/low of all M1 bars from 00:00 true UTC (Tokyo 09:00, no DST) up to the London open
+(08:00 Europe/London, DST-aware: 07:00 UTC in BST, 08:00 UTC in GMT). Volatility yardstick: H1 ATR(24)
+(simple average of true range) of the last H1 bar completed at the London open.
+
+Setups (all decided on completed M5 bars, filled at the next M1 open):
+- "bo"   breakout continuation: first fresh M5 close beyond the range (+ buffer) after London open + bo_start_min.
+- "fade" with fade_trigger="reclaim": price trades beyond the range, then an M5 bar closes back inside ->
+         trade back into the range, stop beyond the sweep extreme.
+- "fade" with fade_trigger="break" (DEFAULT_PARAMS): fade the first fresh M5 close beyond the range that
+         happens in the first `fade_end_min` minutes after the London open (opening stop-hunt).
+Exits: stop sl_atr x ATR, target tp_r x stop, time exit after max_hold_min, never past 20:50 UTC.
 
 DATA CLOCK. The bundled parquet is stamped "New York wall-clock + 5h", not true UTC: the 17:00 ET daily
-break sits at 22:00 and the 08:30 ET news spike at 13:30 all year round, so in US summer time every
-timestamp is 1h ahead of true UTC. Session times are therefore computed in true UTC / local exchange time
-with zoneinfo and then mapped onto the data's clock (`data_clock="ny+5"`). Use `data_clock="utc"` for a
-feed that is really UTC (e.g. an MQL5 port that works from TimeGMT()).
+break sits at 22:00 and the 08:30 ET news spike at 13:30 all year round, so while US daylight saving is in
+force every timestamp is 1h ahead of true UTC. Session times are therefore computed in true UTC / local
+exchange time with zoneinfo and then mapped onto the data's clock (`data_clock="ny+5"`). Use
+`data_clock="utc"` for a feed that really is UTC (an MQL5 port working from TimeGMT()).
 """
 from zoneinfo import ZoneInfo
 
@@ -28,17 +35,18 @@ TAG_BO, TAG_FADE = 1, 2
 DEFAULT_PARAMS = dict(
     mode="fade",             # "bo", "fade" or "bo+fade"
     asia_start_utc=0,        # range starts at 00:00 true UTC (Tokyo 09:00, no DST) and ends at the London open
-    window_min=180,          # trade signals from the London open (08:00 Europe/London) for 180 minutes
+    range_end_min=0,         # range ends (and the trade window starts) this many minutes after the London open
+    window_min=180,          # trade signals for 180 minutes after the range ends
     atr_tf="1h", atr_len=24,  # volatility yardstick: H1 ATR(24) of the last H1 bar completed before the London open
     min_w_atr=0.0, max_w_atr=99.0,  # range-width filter in ATR units
-    sl_atr=1.0,              # stop distance in ATR for breakouts and "break" fades
-    tp_r=1.5,                # target = tp_r x stop distance
+    sl_atr=0.5,              # stop distance in ATR for breakouts and "break" fades
+    tp_r=1.25,               # target = tp_r x stop distance
     # breakout continuation
     bo_start_min=0,          # ignore breakouts in the first N minutes after the London open (opening stop-hunts)
     bo_buf_atr=0.0,          # M5 close must exceed the range by this many ATR
     # fade
-    fade_trigger="reclaim",  # "reclaim": sweep then M5 close back inside; "break": fade the first M5 close beyond
-    fade_end_min=180,        # fade triggers only within the first N minutes after the London open
+    fade_trigger="break",    # "reclaim": sweep then M5 close back inside; "break": fade the first M5 close beyond
+    fade_end_min=15,         # fade triggers only within the first N minutes after the London open
     sweep_min_atr=0.0,       # (reclaim) high must exceed the range by more than this to count as a sweep
     max_ext_atr=1.0,         # (reclaim) if price ran further than this beyond the range it is a real breakout
     max_sweep_bars=6,        # (reclaim) the close back inside must come within this many M5 bars of the sweep
@@ -61,12 +69,12 @@ def _data_clock(utc_ns: np.ndarray, clock: str) -> np.ndarray:
     return ns(loc)
 
 
-def _day_events(dates, asia_start_utc, window_min, flat_utc, clock):
+def _day_events(dates, asia_start_utc, window_min, flat_utc, clock, range_end_min=0):
     """Per weekday: asia range start/end, trade window end, flat time (all on the data clock, int64 ns)."""
     lon = ZoneInfo("Europe/London")
     d = [x for x in dates if x.dayofweek < 5]
     lo_utc = np.array([pd.Timestamp(year=x.year, month=x.month, day=x.day, hour=8, tz=lon).tz_convert("UTC").value
-                       for x in d], dtype=np.int64)
+                       for x in d], dtype=np.int64) + int(range_end_min) * MIN
     midnight = np.array([pd.Timestamp(year=x.year, month=x.month, day=x.day, tz="UTC").value for x in d], dtype=np.int64)
     a0 = midnight + int(asia_start_utc * 60) * MIN
     fl = midnight + (flat_utc[0] * 60 + flat_utc[1]) * MIN
@@ -74,7 +82,7 @@ def _day_events(dates, asia_start_utc, window_min, flat_utc, clock):
     return tuple(_data_clock(v, clock) for v in (a0, lo_utc, w1, fl))
 
 
-def generate_signals(m1: pd.DataFrame, mode="fade", asia_start_utc=0, window_min=180, atr_tf="1h", atr_len=24,
+def generate_signals(m1: pd.DataFrame, mode="fade", asia_start_utc=0, range_end_min=0, window_min=180, atr_tf="1h", atr_len=24,
                      min_w_atr=0.0, max_w_atr=99.0, sl_atr=1.0, tp_r=1.5, bo_start_min=0, bo_buf_atr=0.0,
                      fade_trigger="reclaim", fade_end_min=180, sweep_min_atr=0.0, max_ext_atr=1.0,
                      max_sweep_bars=6, sl_buf_atr=0.1, min_sl_atr=0.25, max_sl_atr=1.5, max_hold_min=90,
@@ -95,7 +103,7 @@ def generate_signals(m1: pd.DataFrame, mode="fade", asia_start_utc=0, window_min
     a_ht = atr(ht["high"], ht["low"], ht["close"], atr_len)
 
     dates = pd.DatetimeIndex(idx.normalize().unique())
-    a0, lo_t, w1, fl = _day_events(dates, asia_start_utc, window_min, flat_utc, data_clock)
+    a0, lo_t, w1, fl = _day_events(dates, asia_start_utc, window_min, flat_utc, data_clock, range_end_min)
     # ATR of the last HTF bar completed at the London open
     A = align_htf_to_m1(pd.DatetimeIndex(pd.to_datetime(lo_t, unit="ns", utc=True)), ht.index, atr_tf, a_ht)
 

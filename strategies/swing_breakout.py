@@ -1,10 +1,20 @@
-"""Swing breakout trend following for XAUUSD (H4 Donchian breakout + trend filter + ATR trailing stop).
+"""Swing breakout trend following for XAUUSD (H4 Donchian breakout + EMA trend filter + ATR chandelier stop).
+
+RESEARCH RESULT: WEAK / NOT STATISTICALLY ESTABLISHED. Positive point estimates on dev and on 2024, but the
+edge cannot be told apart from zero with the ~3 trades/month this produces:
+    dev 2022-2023 (no limits, default spread + 5%/yr swap): 80 trades, avg +0.156R, SE 0.223 (t 0.7), PF 1.14
+    2024 validation (run once, not revised):               39 trades, avg +0.280R, SE 0.322 (t 0.9), PF 1.41
+    the 50 dev parameter sets averaged only +0.02R (H4 weekend-hold sets +0.05R); removing the best 3 trades
+    makes either period negative; 2024 profit came from longs (+0.95R) while shorts lost (-0.59R).
+Closing on Friday (fri_close=True) loses on dev (-0.08R): all of the profit comes from trades held > 10 days.
 
 Idea: when a completed H4 (or H1) bar CLOSES beyond the highest high / lowest low of the previous
 `lookback` bars, in the direction of a slower trend filter, enter at the next M1 open. Initial stop
-`sl_atr` x ATR. Once the trade is `be_r` R in profit the stop goes to entry + `be_lock_r` R and from
-then on trails `trail_atr` x ATR behind the best price reached since entry (chandelier stop with the
-ATR frozen at entry). No profit target. Time stop after `max_hold_days`; optional flat on Friday.
+`sl_atr` x ATR. Chandelier trailing stop `trail_atr` x ATR (ATR frozen at entry) behind the best price
+since entry, active from entry when be_r=0 (default; the trail only rises above the initial stop once
+the trade is (trail_atr - sl_atr) ATR in profit). With be_r>0 the stop first goes to entry + be_lock_r R
+at +be_r R and only then starts trailing. No profit target. Time stop after `max_hold_days`; optional
+flat on Friday.
 
 Bars are built in BROKER SERVER TIME, not UTC: most MT5 gold brokers run GMT+2 / GMT+3 (New York
 close), so H4 and D1 bars start at 17:00 New York time. In the data clock used here (HistData,
@@ -18,14 +28,15 @@ Conventions (same as strategies/example_ema_pullback.py):
 - a signal decided on a bar's close fills at the open of the first M1 bar after that bar
 - all distances are $ from the fill price, expressed as multiples of ATR(atr_len) of the signal TF
 
-MQL5 port (all bar-by-bar):
-- on each new H4 bar (server time): c = close[1], up = max(high[2..lookback+1]), dn = min(low[2..lookback+1]),
-  ATR = iATR(H4, atr_len)[1], trend filter on bar 1 (see `trend` below).
-- long if c > up and trend up, short if c < dn and trend down; only when flat.
-- SL = entry -/+ sl_atr*ATR. On every new M1 bar: best = max(best, high of closed M1 bar) (shorts: min low + spread);
-  if best >= entry + be_r*R: SL = max(SL, entry + be_lock_r*R) and from then on SL = max(SL, best - trail_atr*ATR).
-- close after max_hold_days calendar days; if fri_close: close on Friday at fri_exit_h (data clock = server - 2 h)
-  and open no new trades on Friday at/after fri_cutoff_h.
+MQL5 port (all bar-by-bar; DEFAULT_PARAMS):
+- on each new H4 bar (server time GMT+2/+3): c = close[1], up = max(high[2..21]), dn = min(low[2..21]),
+  ATR = iATR(H4, 14)[1], E = iMA(H4, 50, EMA, close)[1].
+- only when flat: long if c > up and c > E; short if c < dn and c < E. Fill at market (first tick of the new bar).
+- SL = entry -/+ 2.0*ATR, no TP. On every new M1 bar: best = max(best, high of the closed M1 bar)
+  (shorts: min(best, low + spread)); SL = max(SL, best - 5.0*ATR)  (shorts: min(SL, best + 5.0*ATR)).
+- close at market 14 calendar days after entry. Positions are held over weekends (fri_close=False).
+- if fri_close: close on Friday at fri_exit_h of the data clock (= server time - 2 h, i.e. 22:00 server) and
+  open no new trades on Friday at/after fri_cutoff_h (data clock).
 """
 from __future__ import annotations
 
@@ -44,10 +55,10 @@ DEFAULT_PARAMS = dict(
     slope_bars=6,          # 'ema_slope': EMA[t] vs EMA[t - slope_bars]
     atr_len=14,
     sl_atr=2.0,            # initial stop, x ATR
-    be_r=1.0,              # at +be_r R: stop to entry + be_lock_r R and trailing starts (0 = trail from entry, no lock)
+    be_r=0.0,              # at +be_r R: stop to entry + be_lock_r R and trailing starts (0 = trail from entry, no lock)
     be_lock_r=0.1,
-    trail_atr=3.0,         # trailing distance x ATR (0 = off)
-    max_hold_days=10,      # calendar days
+    trail_atr=5.0,         # chandelier: stop = best price since entry - trail_atr x ATR(at entry), only ever tightened
+    max_hold_days=14,      # calendar days (the 2-week cap)
     fri_close=False,       # True: flat on Friday at fri_exit_h, no new entries on Friday from fri_cutoff_h
     fri_exit_h=20,
     fri_cutoff_h=12,
@@ -74,7 +85,7 @@ def _bars(m1: pd.DataFrame, t: np.ndarray, minutes: int, offset_h: float) -> dic
 
 
 def generate_signals(m1: pd.DataFrame, tf_min=240, bar_offset_h=2, lookback=20, trend="ema", trend_len=50, slope_bars=6,
-                     atr_len=14, sl_atr=2.0, be_r=1.0, be_lock_r=0.1, trail_atr=3.0, max_hold_days=10,
+                     atr_len=14, sl_atr=2.0, be_r=0.0, be_lock_r=0.1, trail_atr=5.0, max_hold_days=14,
                      fri_close=False, fri_exit_h=20, fri_cutoff_h=12, sides="both", max_atr_pct=0.0) -> Signals:
     t = ns(m1.index)
     n_m1 = len(t)
@@ -136,23 +147,24 @@ def generate_signals(m1: pd.DataFrame, tf_min=240, bar_offset_h=2, lookback=20, 
     t_entry = t[entry]
     ent_ts = pd.to_datetime(t_entry, utc=True)
 
-    # --- exits: time stop and (optionally) Friday flat
-    t_exit = t_entry + int(max_hold_days * 24) * _NS_H
+    # --- exits: time stop (first M1 bar at/after entry + max_hold_days; after a gap that is the reopen,
+    # as in an EA) and optionally Friday flat (if the market is already closed at that time -- holiday /
+    # early close -- exit at the open of the last M1 bar before the gap instead of holding into the reopen)
+    t_hold = t_entry + int(round(max_hold_days * 24)) * _NS_H
+    exit_idx = np.searchsorted(t, t_hold)
+    exit_idx = np.where(exit_idx >= n_m1, n_m1, exit_idx)
     keep = np.ones(len(entry), bool)
     if fri_close:
-        dow = ent_ts.dayofweek.to_numpy()
+        dow = ent_ts.dayofweek.to_numpy().astype(np.int64)
         hr = ent_ts.hour.to_numpy()
-        day0 = ns(ent_ts.normalize())
-        fri = day0 + ((4 - dow) % 7) * 24 * _NS_H + int(fri_exit_h) * _NS_H
-        # Saturday/Sunday entries (Sunday reopen) belong to the coming week: (4 - 6) % 7 = 5 days -> that Friday
-        t_exit = np.minimum(t_exit, fri)
+        # Sunday-reopen entries belong to the coming week: (4 - 6) % 7 = 5 days -> that Friday
+        t_fri = ns(ent_ts.normalize()) + ((4 - dow) % 7) * 24 * _NS_H + int(fri_exit_h) * _NS_H
+        fx = np.searchsorted(t, t_fri)
+        late = (fx < n_m1) & (t[np.minimum(fx, n_m1 - 1)] - t_fri > 5 * _NS_MIN)
+        fx = np.where(late, fx - 1, fx)
+        exit_idx = np.minimum(exit_idx, fx)
         keep &= ~((dow == 4) & (hr >= fri_cutoff_h))
-    exit_idx = np.searchsorted(t, t_exit)
-    # if the market is closed at the target time (holiday / early close), exit at the open of the last bar before the gap
-    clipped = np.minimum(exit_idx, n_m1 - 1)
-    late = (exit_idx < n_m1) & (t[clipped] - t_exit > 5 * _NS_MIN)
-    exit_idx = np.where(late, exit_idx - 1, exit_idx)
-    exit_idx = np.where(exit_idx >= n_m1, -1, exit_idx)  # beyond data: engine closes at end of data
+    exit_idx = np.where(exit_idx >= n_m1, -1, exit_idx)  # beyond the data: the engine closes at end of data
     keep &= (exit_idx == -1) | (exit_idx > entry)
 
     entry, direction, sl, atr_e, exit_idx = entry[keep], direction[keep], sl[keep], atr_e[keep], exit_idx[keep]
