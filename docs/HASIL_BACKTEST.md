@@ -1,0 +1,83 @@
+# Hasil riset & backtest (XAUUSD, akun cent $50)
+
+## TL;DR
+- **Scalping gold (M1–M15) nggak punya edge setelah spread.** Lima gaya scalping dites dengan rapi, dan semuanya ±0R sebelum biaya.
+  Setelah spread, semuanya minus, dan di 2025 semuanya rugi 13–22%.
+- **Yang lolos: swing trend-pullback** (arah dari H4, entry di H1, tahan 1–5 hari, flat tiap Jumat).
+  Positif di 2022–23, 2024, dan di **2025 yang disimpan sebagai ujian akhir** (+28% di akun $50, drawdown maks 9.9%).
+- Jadi EA-nya **bukan scalper**. Trade-nya jarang (±4 per bulan), tapi tiap trade punya peluang menang yang masuk akal.
+  "Dikit-dikit jadi bukit"-nya datang dari konsistensi, bukan dari banyaknya trade.
+
+## Cara ngetes (biar hasilnya bisa dipercaya)
+- Data: XAUUSD M1 2022–2025 (HistData), dikonversi ke UTC dan dicek pakai jam rilis NFP.
+- Mesin backtest sendiri (`backtest/engine.py`) dengan aturan konservatif:
+  - Entry di bar M1 berikutnya. Spread kena di entry (buy) atau exit (sell).
+  - Kalau SL dan TP kena di bar yang sama, dianggap SL duluan.
+  - Gap harga di-fill di harga open bar berikutnya.
+  - Swap 5%/tahun dihitung tiap malam (×3 tiap Rabu).
+- Mesinnya dites: entry acak tanpa biaya hasilnya ≈ 0R (nggak bias), plus 13 unit test.
+- Biaya default: spread = max($0.25, 0.8 bps harga). Di harga $4.300 itu sekitar $0.34, mirip spread HFM Cent.
+  Ada juga skenario stress: spread $0.40 / 1.2 bps, slippage $0.10, swap 8%.
+- Protokol anti-overfitting:
+  1. Strategi dikembangkan di 2022–2023.
+  2. Divalidasi sekali di 2024.
+  3. **Data 2025 disembunyikan** dari semua agen riset. Aturan lulus/gagal ditulis dan di-commit **sebelum** 2025 dibuka
+     (`results/HOLDOUT_PLAN.md`).
+
+## Hasil scalping (semua NGGAK layak)
+| Gaya | Edge sebelum biaya | Setelah biaya (2024) | Akun $50 di 2025 |
+|---|---|---|---|
+| Trend pullback M5 | +0.03R | −0.04R | −15.0% |
+| Opening range breakout | ≈0 | −0.16R di 2025 | −22.3% |
+| Asian range (breakout/fade) | ≈0 | −0.05R (stress) | −16.5% |
+| Mean reversion (Bollinger/RSI) | ≈0 | −0.12R | −12.7% |
+| Momentum breakout M1/M5 | ≈0 | −0.01R | −13.9% |
+
+Penyebabnya: di horizon menit, gerak gold hampir acak. Spread ~$0.35 dengan SL $3–5 itu sama dengan
+7–12% dari risk di **setiap** trade. Pakai broker spread paling tipis pun hasilnya tetap minus.
+
+## Strategi terpilih: `swing_pullback`
+**Aturan:**
+- **Trend (H4):** close bar H4 terakhir di atas EMA(40), dan EMA(40) lebih tinggi dari 6 bar sebelumnya → cuma cari BUY.
+  Kebalikannya → cuma cari SELL.
+- **Entry (H1):** RSI(14) balik naik nembus 40 (buy) atau balik turun nembus 60 (sell). Masuk di awal bar H1 berikutnya.
+- **Stop:** 2 × ATR(14) H4. Lot dihitung supaya kena SL = −2% equity.
+- **Trailing:** 3 × ATR, mulai ngunci profit setelah harga jalan +1 ATR.
+- **Tutup semua tiap Jumat 20:00 UTC** (Sabtu 03:00 WIB), jadi nggak ada risiko gap weekend.
+- Nggak entry jam 21:00–24:00 UTC (rollover), dan nggak entry Jumat setelah 12:00 UTC.
+
+| Periode | Trade | Win rate | Rata-rata | Profit factor | Akun $50 | DD maks | Bulan profit |
+|---|---|---|---|---|---|---|---|
+| 2022–2023 (dev) | 74 | 53% | +0.42R | 2.29 | $50 → $87 | 8.4% | 62% |
+| 2024 (validasi) | 47 | 36% | +0.21R | 1.41 | $50 → $59 | 8.7% | 42% |
+| **2025 (ujian akhir)** | **53** | **58%** | **+0.26R** | **1.92** | **$50 → $64** | **9.9%** | **67%** |
+
+Grafik equity: `results/swing_pullback/equity.png`. Daftar trade: `results/swing_pullback/trades_*.csv`.
+
+**Monte Carlo 6 bulan** (pakai distribusi trade 2025, 5.000 simulasi):
+- Peluang nyentuh hard stop (−30%): **0%**
+- Peluang profit: 86%
+- Median saldo $56.8 (+14%). 5% terburuk $47.2, 5% terbaik $69.7.
+- Drawdown maks (95% kasus) ≤ 11.8%
+
+**Skenario stress** (spread lebih lebar + swap 8%): rata-rata tetap positif (+0.39 / +0.18 / +0.23R).
+
+## Yang harus lu tahu (jujur)
+- **Buktinya "lumayan", bukan "pasti".** Gabungan 2022–2025: 174 trade, rata-rata +0.31R, t ≈ 3.1
+  (sudah termasuk periode pengembangan). Di 2025 aja t ≈ 1.7.
+- **Profit didominasi posisi BUY.** SELL rugi di 2024 (−0.52R) dan 2025 (−0.13R), dua tahun bull gold.
+  Kalau gold masuk fase turun panjang, performa bisa jauh lebih jelek dari tabel di atas.
+  Ada opsi `InpSides = Long only`, tapi itu taruhan tambahan bahwa gold terus naik.
+- **Trade-nya jarang:** ±3–4 per bulan, dan ada bulan yang rugi. Pertumbuhan realistis kira-kira **+1–2% per bulan rata-rata**,
+  bukan per hari.
+- **Hasil live pasti beda dikit:** spread broker, slippage, bar H4 yang ngikut jam server (udah dites geser 2 jam, hasilnya mirip),
+  filter news (nggak ada di backtest).
+
+## Reproduksi
+```bash
+pip install -r requirements.txt
+git clone --depth 1 https://github.com/Motasim-1/data-xauusd-2025-input.git /tmp/xau
+python scripts/prepare_data.py /tmp/xau/*.zip
+python scripts/report.py swing_pullback --out results/swing_pullback
+python -m pytest -q tests
+```
