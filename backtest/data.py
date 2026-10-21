@@ -1,7 +1,10 @@
 """Load HistData.com XAUUSD M1 ASCII exports and convert to a clean UTC OHLC frame.
 
-HistData ASCII timestamps are Eastern Standard Time *without* daylight saving,
-i.e. a fixed UTC-5 offset. Prices are bid.
+HistData documents its ASCII timestamps as EST without daylight saving, but the XAUUSD files
+actually follow New York wall-clock time (EST/EDT): the 08:30 ET US data releases (e.g. NFP)
+appear at 08:30 file time in both winter and summer, and the 17:00-18:00 ET daily break sits at
+17:00 file time all year. Timestamps are therefore localized to America/New_York and converted to
+UTC. Prices are bid.
 """
 from __future__ import annotations
 
@@ -12,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-HISTDATA_UTC_OFFSET = pd.Timedelta(hours=5)
+HISTDATA_TZ = "America/New_York"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PARQUET = REPO_ROOT / "data" / "xauusd_m1.parquet"
 
@@ -25,10 +28,13 @@ def _read_histdata_csv(fh) -> pd.DataFrame:
         names=["ts", "open", "high", "low", "close", "volume"],
         dtype={"ts": str},
     )
-    idx = pd.to_datetime(df["ts"], format="%Y%m%d %H%M%S") + HISTDATA_UTC_OFFSET
+    local = pd.DatetimeIndex(pd.to_datetime(df["ts"], format="%Y%m%d %H%M%S"), name="time")
+    # gold is closed on Sunday morning when clocks change, so DST gaps/overlaps should not occur;
+    # anything ambiguous is dropped rather than guessed
+    utc = local.tz_localize(HISTDATA_TZ, ambiguous="NaT", nonexistent="NaT").tz_convert("UTC").as_unit("ns")
     out = df[["open", "high", "low", "close"]].astype("float64")
-    out.index = pd.DatetimeIndex(idx, name="time").tz_localize("UTC").as_unit("ns")
-    return out
+    out.index = utc
+    return out[~out.index.isna()]
 
 
 def load_histdata(paths: list[Path]) -> pd.DataFrame:

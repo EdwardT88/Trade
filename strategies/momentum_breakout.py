@@ -1,5 +1,8 @@
 """Momentum breakout scalp: M5 Donchian breakout with volatility expansion during the New York morning.
 
+VERDICT: not viable. ~0 R/trade on dev 2022-23 (+0.013), -0.012 R on 2024 validation, -0.047 R under
+stress costs. See results/momentum_breakout_dev.md.
+
 Rules (all decided on completed M5 bars, filled at the next M1 open):
 - Donchian channel = highest high / lowest low of the previous `donchian_n` completed M5 bars
   (the signal bar itself is excluded).
@@ -28,10 +31,10 @@ from backtest.engine import Signals, align_htf_to_m1, htf_close_to_m1_entry, ns
 from backtest.indicators import atr, ema, rolling_max, rolling_min
 
 DEFAULT_PARAMS = dict(
-    tf="5min", donchian_n=24, fresh_only=False,
-    atr_len=14, vol_fast=5, vol_slow=50, vol_ratio=0.0,
+    tf="5min", donchian_n=48, fresh_only=False,
+    atr_len=14, vol_fast=5, vol_slow=50, vol_ratio=1.2,
     trend_mode=0, trend_tf="1h", trend_len=50,
-    session_ny=(8.0, 12.0), flat_ny=15.5, data_clock="ny+5",
+    session_ny=(9.0, 12.0), flat_ny=15.5, data_clock="ny+5",
     sl_atr=2.0, tp_r=1.5, be_r=0.0, trail_atr=0.0, max_hold_min=60,
 )
 
