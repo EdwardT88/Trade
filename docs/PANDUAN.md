@@ -33,7 +33,10 @@ Jadi ini **swing**, bukan scalping. Scalping udah dites dan kalah sama spread (d
 | **Hard stop** | −30% dari saldo awal | Equity nyentuh $35 (3.500 USC) → semua posisi ditutup dan EA **berhenti total** sampai lu review. |
 | Margin | ≤ 50% free margin | Nggak pernah buka posisi yang makan lebih dari setengah free margin. |
 | Filter spread | $1.00 / 10% SL | Spread lagi lebar → entry di-skip. |
-| Filter news | ±15 menit | Nggak entry di sekitar news merah USD (kalender MT5, cuma aktif di live/demo). |
+| Libur / pasar tutup awal | `InpExtraFlatUTC` | Posisi ditutup sebelum Black Friday, Natal, Tahun Baru, Good Friday, dan EA nggak entry 8 jam sebelumnya. Daftar tanggal bisa lu tambah. |
+| EA dobel | — | EA nolak jalan kalau udah kepasang di chart lain dengan simbol yang sama (biar risk nggak dobel). |
+| Deposit / withdraw | otomatis | Saldo awal buat hitungan hard stop ikut disesuaikan. |
+| Filter news (opsional) | OFF | Bisa dinyalain (`InpUseNewsFilter`), tapi nggak ada di backtest, jadi default dimatiin biar sama persis dengan yang dites. |
 
 Nggak ada martingale, grid, averaging, atau posisi tanpa SL.
 
@@ -75,9 +78,9 @@ Cek di panel kiri atas chart: `UTC hh:mm` harus sama dengan jam UTC sekarang (= 
 2. Modeling: **Every tick based on real ticks** (atau "1 minute OHLC" biar lebih cepat).
 3. Deposit **5000** (USC), leverage sesuai akun.
 4. Periode: 2025-01-01 sampai sekarang.
-5. Di tab Inputs: set `InpServerTZ = Fixed offset` dan `InpFixedOffsetHours` sesuai broker
-   (Exness 0; HFM 2 buat musim dingin / 3 buat musim panas, ambil yang paling sering di periode tes).
-   Di tester, mode Auto nggak bisa baca jam GMT.
+5. Di tab Inputs **wajib** ganti `InpServerTZ` (di tester mode Auto ditolak, karena tester nggak bisa baca jam GMT):
+   - Exness → `Fixed offset`, `InpFixedOffsetHours = 0`
+   - HFM / broker GMT+2/+3 → `GMT+2 / GMT+3 with US DST`
 6. Bandingin sama `docs/HASIL_BACKTEST.md`. Jumlah trade dan arah hasil harusnya mirip. Beda dikit itu normal
    (data/spread broker, bar H4 ngikut jam server).
 
@@ -96,7 +99,8 @@ Artinya equity udah turun 30% dari saldo awal. EA nutup semua posisi dan berhent
 1. Cek log (tab *Experts*) dan file CSV di `File → Open Data Folder → ../Common/Files/GoldSwingCent_<login>.csv`.
 2. Diskusiin dulu: apa pasar lagi beda banget (misal gold lagi turun panjang), atau ada masalah eksekusi/spread.
 3. Kalau mau lanjut: set `InpResetHalt = true`, klik OK, terus balikin ke `false`.
-   Kalau mau pakai saldo awal baru buat hitungan hard stop, isi `InpStartBalance`.
+   Saldo sekarang otomatis jadi saldo awal baru buat hitungan hard stop. Kalau mau angka lain, isi `InpStartBalance`
+   **dalam satuan akun** (akun cent: USC, jadi $50 = `5000`, bukan `50`).
 
 ## 7. Input penting
 
@@ -111,5 +115,7 @@ Artinya equity udah turun 30% dari saldo awal. EA nutup semua posisi dan berhent
 | `InpDailyLossPct` / `InpMaxConsecLosses` | 5 / 3 | Rem harian. |
 | `InpHardStopPct` | 30 | Hard stop dari saldo awal. |
 | `InpServerTZ` / `InpFixedOffsetHours` | Auto / 0 | Zona waktu server (lihat tabel di atas). |
-| `InpUseNewsFilter` | true | Filter news merah USD. |
+| `InpUseNewsFilter` | false | Filter news merah USD (opsional, nggak ada di backtest). |
+| `InpExtraFlatUTC` | 5 tanggal 2026–2027 | Jam UTC buat tutup posisi sebelum libur/pasar tutup awal, format `YYYY.MM.DD HH:MI`, dipisah `;`. Tambahin tiap tahun. |
+| `InpStartBalance` | 0 | Saldo awal hard stop dalam satuan akun (cent = USC). 0 = saldo waktu EA pertama jalan. |
 | `InpMagic` | 20261021 | Ganti kalau pasang lebih dari satu EA di akun yang sama. |

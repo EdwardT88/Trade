@@ -51,7 +51,8 @@ input int        InpFridayCloseHourUTC = 20;         // ... at this UTC hour
 input int        InpFridayLastEntryUTC = 12;         // No new entries on Friday from this UTC hour
 input int        InpNoEntryFromUTC     = 21;         // No new entries from this UTC hour (rollover/reopen spreads) ...
 input int        InpNoEntryToUTC       = 24;         // ... until this UTC hour (24 = midnight)
-input int        InpMaxEntryDelayMin   = 5;          // Skip a signal if the first tick arrives this late after the H1 close
+input int        InpMaxEntryDelayMin   = 5;          // Skip a signal if it cannot be filled within this many minutes of the H1 close
+input string     InpExtraFlatUTC       = "2026.11.27 17:00;2026.12.24 17:00;2026.12.31 17:00;2027.03.25 20:00;2027.11.26 17:00"; // Extra flat times (UTC, ';'-separated): holiday early closes / day before a closed Friday
 
 input group "=== Risk (anti margin call) ==="
 input double InpRiskPct            = 2.0;    // Risk per trade (% of equity)
@@ -62,8 +63,8 @@ input double InpDailyLossPct       = 5.0;    // No new trades for the day after 
 input int    InpMaxTradesPerDay    = 4;      // Max new trades per UTC day
 input int    InpMaxConsecLosses    = 3;      // No new trades for the day after this many losses in a row
 input double InpHardStopPct        = 30.0;   // HALT the EA if equity falls this % below the start balance
-input double InpStartBalance       = 0.0;    // Start balance for the hard stop (0 = balance when the EA first runs)
-input bool   InpResetHalt          = false;  // Set true once to clear a HALT after reviewing, then back to false
+input double InpStartBalance       = 0.0;    // Hard-stop start balance in ACCOUNT currency (cent: USC, $50 = 5000). 0 = balance at first run
+input bool   InpResetHalt          = false;  // Set true once to clear a HALT (start balance = current balance), then back to false
 
 input group "=== Execution ==="
 input long   InpMagic              = 20261021; // Magic number
@@ -77,7 +78,7 @@ input ENUM_SERVER_TZ InpServerTZ   = TZ_AUTO; // Broker server time zone
 input int    InpFixedOffsetHours   = 0;       // Server GMT offset for Fixed mode and the tester (Exness = 0)
 
 input group "=== News filter (live only, MT5 economic calendar) ==="
-input bool   InpUseNewsFilter      = true;   // Block new entries around high-impact USD news
+input bool   InpUseNewsFilter      = false;  // Block new entries around high-impact USD news (OFF = same rules as the backtest)
 input int    InpNewsMinutesBefore  = 15;     // Minutes before the event
 input int    InpNewsMinutesAfter   = 15;     // Minutes after the event
 
@@ -97,6 +98,8 @@ datetime g_newsCacheTime = 0;
 datetime g_newsTimes[];
 string   g_lastSkip      = "";
 string   g_lastSignal    = "";
+datetime g_lastCloseTry  = 0;
+datetime g_lastOrderTry  = 0;
 
 //+------------------------------------------------------------------+
 //| Time helpers                                                     |
@@ -157,7 +160,9 @@ int ServerOffsetSeconds()
 
 datetime ServerToUtc(const datetime server) { return server - ServerOffsetSeconds(); }
 datetime UtcToServer(const datetime utc)    { return utc + ServerOffsetSeconds(); }
-datetime NowUtc()                           { return ServerToUtc(TimeTradeServer()); }
+// TimeCurrent() is the server time of the tick being handled (the same clock as the bars); TimeTradeServer()
+// follows the PC clock and can read hh-1:59:59 on the first tick of a new hour
+datetime NowUtc()                           { return ServerToUtc(TimeCurrent()); }
 datetime DayStart(const datetime t)         { return t - (t % 86400); }
 
 //+------------------------------------------------------------------+
@@ -171,17 +176,31 @@ double GvGet(const string key, const double def)
    return def;
   }
 
-void GvSet(const string key, const double value) { GlobalVariableSet(g_gvPrefix + key, value); }
+void GvSet(const string key, const double value)
+  {
+   if(GlobalVariableSet(g_gvPrefix + key, value) == 0)
+      PrintFormat("GlobalVariableSet(%s) failed: %d", g_gvPrefix + key, GetLastError());
+  }
+
+// for state that must survive a crash (start balance, halt flag, trailing distance)
+void GvSetFlush(const string key, const double value)
+  {
+   GvSet(key, value);
+   GlobalVariablesFlush();
+  }
 void GvDel(const string key)                     { GlobalVariableDel(g_gvPrefix + key); }
 
 double StartBalance() { return GvGet("start", AccountInfoDouble(ACCOUNT_BALANCE)); }
 bool   IsHalted()     { return GvGet("halted", 0.0) > 0.5; }
 
+// peak of CLOSED-trade equity (the backtest sizes against the peak of realized equity)
 void UpdatePeak()
   {
-   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
-   if(eq > GvGet("peak", 0.0))
-      GvSet("peak", eq);
+   if(SelectMyPosition())
+      return;
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+   if(bal > GvGet("peak", 0.0))
+      GvSet("peak", bal);
   }
 
 //+------------------------------------------------------------------+
@@ -281,6 +300,41 @@ void CloseAll(const string why)
      }
   }
 
+// close at most once every 5 s so a failing close does not spam requests on every tick
+void CloseAllThrottled(const string why)
+  {
+   if(TimeCurrent() - g_lastCloseTry < 5)
+      return;
+   g_lastCloseTry = TimeCurrent();
+   CloseAll(why);
+  }
+
+//+------------------------------------------------------------------+
+//| Extra flat times (holiday early closes)                          |
+//+------------------------------------------------------------------+
+// seconds until the next extra flat time within `horizon` (or that passed less than 12 h ago: returns <= 0);
+// returns a large value when none applies
+long SecondsToExtraFlat(const datetime nowUtc, const long horizon)
+  {
+   long best = LONG_MAX;
+   string parts[];
+   int n = StringSplit(InpExtraFlatUTC, ';', parts);
+   for(int i = 0; i < n; i++)
+     {
+      StringTrimLeft(parts[i]);
+      StringTrimRight(parts[i]);
+      if(StringLen(parts[i]) < 10)
+         continue;
+      datetime t = StringToTime(parts[i]);
+      if(t <= 0)
+         continue;
+      long d = (long)t - (long)nowUtc;
+      if(d > -12 * 3600 && d <= horizon && d < best)
+         best = d;
+     }
+   return best;
+  }
+
 //+------------------------------------------------------------------+
 //| Price / volume helpers                                           |
 //+------------------------------------------------------------------+
@@ -370,13 +424,13 @@ void RefreshNews()
   {
    if(g_newsCacheTime > 0 && TimeTradeServer() - g_newsCacheTime < 3600)
       return;
-   g_newsCacheTime = TimeTradeServer();
-   ArrayResize(g_newsTimes, 0);
    MqlCalendarValue values[];
    datetime from = TimeTradeServer() - 2 * 3600;
    datetime to   = TimeTradeServer() + 36 * 3600;
-   if(CalendarValueHistory(values, from, to, NULL, "USD") <= 0)
-      return;
+   if(!CalendarValueHistory(values, from, to, NULL, "USD"))
+      return;   // retry on the next call
+   g_newsCacheTime = TimeTradeServer();
+   ArrayResize(g_newsTimes, 0);
    for(int i = 0; i < ArraySize(values); i++)
      {
       MqlCalendarEvent ev;
@@ -439,6 +493,11 @@ bool CanOpenNewTrade(string &why)
       why = "Friday cutoff";
       return false;
      }
+   if(SecondsToExtraFlat(NowUtc(), 8 * 3600) <= 8 * 3600)
+     {
+      why = "holiday early close ahead";
+      return false;
+     }
    DayStats ds = TodayStats();
    double dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE) - ds.realized;
    if(ds.realized + FloatingPnL() <= -InpDailyLossPct / 100.0 * dayStartBalance)
@@ -468,6 +527,7 @@ bool CanOpenNewTrade(string &why)
 //+------------------------------------------------------------------+
 //| Open a trade with the stop at an exact distance from the fill    |
 //+------------------------------------------------------------------+
+// returns true when a position was opened
 bool OpenTrade(const bool isBuy, const double slDist, const double trailDist, const string tag)
   {
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
@@ -501,9 +561,13 @@ bool OpenTrade(const bool isBuy, const double slDist, const double trailDist, co
       PrintFormat("Open %s failed: %u %s", isBuy ? "BUY" : "SELL", rc, g_trade.ResultRetcodeDescription());
       return false;
      }
+   // the position identifier equals the ticket of the order that opened it; store the trail even if the
+   // position list has not refreshed yet
+   ulong openOrder = g_trade.ResultOrder();
+   if(trailDist > 0.0 && openOrder > 0)
+      GvSetFlush(StringFormat("trail_%I64d", (long)openOrder), trailDist);
    if(SelectMyPosition())
      {
-      long posId = PositionGetInteger(POSITION_IDENTIFIER);
       ulong ticket = (ulong)PositionGetInteger(POSITION_TICKET);
       double fill = PositionGetDouble(POSITION_PRICE_OPEN);
       // re-anchor the stop to the actual fill so the distance matches the plan exactly
@@ -512,8 +576,6 @@ bool OpenTrade(const bool isBuy, const double slDist, const double trailDist, co
          if(!g_trade.PositionModify(ticket, nsl, 0.0))
             PrintFormat("Stop re-anchor failed (kept %.2f): %u %s", PositionGetDouble(POSITION_SL),
                         g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription());
-      if(trailDist > 0.0)
-         GvSet(StringFormat("trail_%I64d", posId), trailDist);
      }
    PrintFormat("%s %.2f lots @ %.2f  SL %.2f  trail %.2f  risk %.1f%%  (%s)", isBuy ? "BUY" : "SELL", lots,
                entry, sl, trailDist, riskPct, tag);
@@ -548,64 +610,103 @@ void StrategyDeinit()
       IndicatorRelease(g_hRsi);
   }
 
-// +1 uptrend, -1 downtrend, 0 none, using the last completed H4 bar
-int H4Trend()
+// trend: +1 up, -1 down, 0 none, from the last completed H4 bar; false when the data is not ready yet
+bool H4TrendEx(int &trend)
   {
+   trend = 0;
    double ema[];
    ArraySetAsSeries(ema, true);
    int need = InpTrendSlopeBars + 1;
    if(CopyBuffer(g_hEma, 0, 1, need, ema) != need)
-      return 0;
+      return false;
    double c1 = iClose(_Symbol, PERIOD_H4, 1);
    if(c1 <= 0.0)
-      return 0;
+      return false;
    if(c1 > ema[0] && ema[0] > ema[InpTrendSlopeBars])
-      return 1;
-   if(c1 < ema[0] && ema[0] < ema[InpTrendSlopeBars])
-      return -1;
-   return 0;
+      trend = 1;
+   else if(c1 < ema[0] && ema[0] < ema[InpTrendSlopeBars])
+      trend = -1;
+   return true;
   }
 
-// Called on every tick; acts only on the first tick of a new H1 bar
+int H4Trend()
+  {
+   int t = 0;
+   H4TrendEx(t);
+   return t;
+  }
+
+// Evaluated on every tick until the current H1 bar's signal is resolved: no signal, filled, blocked by a
+// risk/time rule, or older than InpMaxEntryDelayMin (the backtest fills at the first M1 bar after the close).
 void CheckEntrySignal()
   {
    datetime h1 = iTime(_Symbol, PERIOD_H1, 0);
    if(h1 == 0 || h1 == g_lastH1Bar)
       return;
-   g_lastH1Bar = h1;
-
+   if(TimeCurrent() - h1 > InpMaxEntryDelayMin * 60)
+     {
+      g_lastH1Bar = h1;   // too late after the H1 close (weekend, daily break, data hole)
+      return;
+     }
    double rsi[];
    ArraySetAsSeries(rsi, true);
-   if(CopyBuffer(g_hRsi, 0, 1, 2, rsi) != 2)
-      return;
-   int trend = H4Trend();
+   int trend = 0;
+   if(CopyBuffer(g_hRsi, 0, 1, 2, rsi) != 2 || !H4TrendEx(trend))
+      return;   // indicator data not ready yet: retry on the next tick
    double lo = InpRsiLevel;
    double hi = 100.0 - InpRsiLevel;
    bool longSig  = (trend > 0) && (rsi[1] < lo) && (rsi[0] >= lo) && InpSides != SIDES_SHORT;
    bool shortSig = (trend < 0) && (rsi[1] > hi) && (rsi[0] <= hi) && InpSides != SIDES_LONG;
    if(!longSig && !shortSig)
-      return;
-   g_lastSignal = StringFormat("%s %s RSI %.1f->%.1f", TimeToString(h1, TIME_DATE | TIME_MINUTES),
-                               longSig ? "LONG" : "SHORT", rsi[1], rsi[0]);
-
-   // the backtest fills right after the H1 close; skip stale signals (weekend, daily break, data holes)
-   if(TimeCurrent() - h1 > InpMaxEntryDelayMin * 60)
      {
-      g_lastSkip = "signal too late after the H1 close";
+      g_lastH1Bar = h1;
       return;
      }
+   g_lastSignal = StringFormat("%s %s RSI %.1f->%.1f", TimeToString(h1, TIME_DATE | TIME_MINUTES),
+                               longSig ? "LONG" : "SHORT", rsi[1], rsi[0]);
    string why = "";
    if(!CanOpenNewTrade(why))
      {
       g_lastSkip = "signal skipped: " + why;
+      g_lastH1Bar = h1;
       return;
      }
    double atr[];
    if(CopyBuffer(g_hAtr, 0, 1, 1, atr) != 1 || atr[0] <= 0.0)
       return;
-   double slDist    = InpStopATR * atr[0];
-   double trailDist = InpTrailATR * atr[0];
-   OpenTrade(longSig, slDist, trailDist, longSig ? "pb-long" : "pb-short");
+   if(TimeCurrent() - g_lastOrderTry < 10)
+      return;   // spread / order retry at most every 10 s within the entry window
+   g_lastOrderTry = TimeCurrent();
+   if(OpenTrade(longSig, InpStopATR * atr[0], InpTrailATR * atr[0], longSig ? "pb-long" : "pb-short"))
+      g_lastH1Bar = h1;
+  }
+
+// ATR(H4) of the last H4 bar completed before `opened` (the value the entry used)
+double EntryAtr(const datetime opened)
+  {
+   int sh = iBarShift(_Symbol, PERIOD_H4, opened, false);
+   double a[];
+   if(sh < 0 || CopyBuffer(g_hAtr, 0, sh + 1, 1, a) != 1 || a[0] <= 0.0)
+      return 0.0;
+   return a[0];
+  }
+
+// trailing distance for a position; rebuilt from the entry ATR if the stored value is missing
+double TrailDistance(const long posId, const datetime opened)
+  {
+   if(InpTrailATR <= 0.0)
+      return 0.0;
+   string key = StringFormat("trail_%I64d", posId);
+   double v = GvGet(key, -1.0);
+   if(v > 0.0)
+      return v;
+   double a = EntryAtr(opened);
+   if(a <= 0.0)
+      return 0.0;
+   v = InpTrailATR * a;
+   GvSetFlush(key, v);
+   PrintFormat("Trailing distance for position %I64d rebuilt from entry ATR: %.2f", posId, v);
+   return v;
   }
 
 // Time exits and the chandelier trailing stop (stop updates once per closed M1 bar, like the backtest)
@@ -619,16 +720,22 @@ void ManagePosition()
    bool     isBuy  = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
    double   curSL  = PositionGetDouble(POSITION_SL);
 
+   datetime nowU = NowUtc();
    MqlDateTime u;
-   TimeToStruct(NowUtc(), u);
-   if(InpFridayClose && u.day_of_week == 5 && u.hour >= InpFridayCloseHourUTC)
+   TimeToStruct(nowU, u);
+   if(InpFridayClose && ((u.day_of_week == 5 && u.hour >= InpFridayCloseHourUTC) || u.day_of_week == 6 || u.day_of_week == 0))
      {
-      CloseAll("Friday close");
+      CloseAllThrottled("Friday close");
+      return;
+     }
+   if(SecondsToExtraFlat(nowU, 0) <= 0)
+     {
+      CloseAllThrottled("holiday early close");
       return;
      }
    if(InpMaxHoldDays > 0 && TimeCurrent() - opened >= InpMaxHoldDays * 86400)
      {
-      CloseAll("max hold time");
+      CloseAllThrottled("max hold time");
       return;
      }
 
@@ -637,7 +744,7 @@ void ManagePosition()
       return;
    g_lastM1Bar = m1;
 
-   double trail = GvGet(StringFormat("trail_%I64d", posId), 0.0);
+   double trail = TrailDistance(posId, opened);
    if(trail <= 0.0)
       return;
    int shiftOpen = iBarShift(_Symbol, PERIOD_M1, opened, false);
@@ -695,9 +802,15 @@ void CheckHardStop()
   {
    double start = StartBalance();
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
-   if(!IsHalted() && eq <= start * (1.0 - InpHardStopPct / 100.0))
+   if(IsHalted())
      {
-      GvSet("halted", 1.0);
+      if(SelectMyPosition())
+         CloseAllThrottled("hard stop (retry)");
+      return;
+     }
+   if(eq <= start * (1.0 - InpHardStopPct / 100.0))
+     {
+      GvSetFlush("halted", 1.0);
       CloseAll("hard stop");
       PrintFormat("HARD STOP: equity %.2f is %.0f%% below the start balance %.2f. EA halted.", eq, InpHardStopPct, start);
       Alert("GoldSwingCent HALTED: equity hit the hard stop. Review before restarting.");
@@ -722,7 +835,7 @@ void OnClosedDeal(const ulong deal)
    if(!InpWriteCsv)
       return;
    string file = StringFormat("GoldSwingCent_%I64d.csv", AccountInfoInteger(ACCOUNT_LOGIN));
-   int h = FileOpen(file, FILE_READ | FILE_WRITE | FILE_CSV | FILE_COMMON | FILE_SHARE_READ, ',');
+   int h = FileOpen(file, FILE_READ | FILE_WRITE | FILE_CSV | FILE_ANSI | FILE_COMMON | FILE_SHARE_READ, ',');
    if(h == INVALID_HANDLE)
       return;
    if(FileSize(h) == 0)
@@ -747,8 +860,18 @@ void OnClosedDeal(const ulong deal)
 
 void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
   {
-   if(trans.type == TRADE_TRANSACTION_DEAL_ADD && trans.deal > 0)
-      OnClosedDeal(trans.deal);
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD || trans.deal == 0)
+      return;
+   if(HistoryDealSelect(trans.deal) && HistoryDealGetInteger(trans.deal, DEAL_TYPE) == DEAL_TYPE_BALANCE)
+     {
+      // deposit (+) or withdrawal (-): shift the hard-stop baseline and the peak by the same amount
+      double flow = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+      GvSetFlush("start", StartBalance() + flow);
+      GvSet("peak", MathMax(0.0, GvGet("peak", 0.0) + flow));
+      PrintFormat("Balance operation %.2f: hard-stop start balance is now %.2f", flow, StartBalance());
+      return;
+     }
+   OnClosedDeal(trans.deal);
   }
 
 //+------------------------------------------------------------------+
@@ -782,21 +905,57 @@ void DrawPanel()
 //+------------------------------------------------------------------+
 //| Lifecycle                                                        |
 //+------------------------------------------------------------------+
+// another chart already runs this EA on the same symbol (two instances would double the risk)
+bool AnotherInstanceOnSymbol()
+  {
+   for(long id = ChartFirst(); id >= 0; id = ChartNext(id))
+      if(id != ChartID() && ChartSymbol(id) == _Symbol
+         && ChartGetString(id, CHART_EXPERT_NAME) == MQLInfoString(MQL_PROGRAM_NAME))
+         return true;
+   return false;
+  }
+
 int OnInit()
   {
-   g_gvPrefix = StringFormat("GSW_%I64d_%I64d_%s_", AccountInfoInteger(ACCOUNT_LOGIN), InpMagic, _Symbol);
-   if((bool)MQLInfoInteger(MQL_TESTER))
+   bool tester = (bool)MQLInfoInteger(MQL_TESTER);
+   if(!tester && AnotherInstanceOnSymbol())
      {
-      // fresh state for every tester pass
-      GlobalVariablesDeleteAll(g_gvPrefix);
+      Alert("GoldSwingCent already runs on another ", _Symbol, " chart. Remove one instance.");
+      return INIT_FAILED;
      }
-   if(!GlobalVariableCheck(g_gvPrefix + "start") || InpStartBalance > 0.0)
-      GvSet("start", InpStartBalance > 0.0 ? InpStartBalance : AccountInfoDouble(ACCOUNT_BALANCE));
+   if(tester && InpServerTZ == TZ_AUTO)
+     {
+      Print("In the Strategy Tester the server offset cannot be measured. Set InpServerTZ to 'Fixed offset' ",
+            "(InpFixedOffsetHours = 0 for Exness) or to 'GMT+2 / GMT+3 with US DST' (HFM and most brokers).");
+      return INIT_PARAMETERS_INCORRECT;
+     }
+   if(InpRiskPct <= 0.0 || InpRiskPct > 5.0 || InpReducedRiskPct <= 0.0 || InpReducedRiskPct > InpRiskPct
+      || InpStopATR <= 0.0 || InpHardStopPct <= 0.0 || InpHardStopPct >= 100.0)
+     {
+      Print("Risk inputs out of range: 0 < reduced risk <= risk <= 5%, stop ATR > 0, 0 < hard stop < 100%.");
+      return INIT_PARAMETERS_INCORRECT;
+     }
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+   if(InpStartBalance > 0.0 && bal > 0.0 && (InpStartBalance < 0.2 * bal || InpStartBalance > 5.0 * bal))
+     {
+      Alert(StringFormat("InpStartBalance %.2f looks wrong for balance %.2f %s (cent account: enter USC, e.g. 5000 for $50)",
+                         InpStartBalance, bal, AccountInfoString(ACCOUNT_CURRENCY)));
+      return INIT_PARAMETERS_INCORRECT;
+     }
+   g_gvPrefix = StringFormat("GSW_%I64d_%I64d_%s_", AccountInfoInteger(ACCOUNT_LOGIN), InpMagic, _Symbol);
+   if(tester)
+      GlobalVariablesDeleteAll(g_gvPrefix);   // fresh state for every tester pass
+   if(InpStartBalance > 0.0)
+      GvSetFlush("start", InpStartBalance);
+   else if(!GlobalVariableCheck(g_gvPrefix + "start") && bal > 0.0)
+      GvSetFlush("start", bal);   // if the account is not synchronised yet, OnTick sets it
    if(InpResetHalt)
      {
-      GvSet("halted", 0.0);
-      GvSet("peak", AccountInfoDouble(ACCOUNT_EQUITY));
-      Print("Halt flag cleared and peak equity reset.");
+      if(InpStartBalance <= 0.0)
+         GvSetFlush("start", bal);   // new baseline, otherwise the EA would halt again on the next tick
+      GvSetFlush("halted", 0.0);
+      GvSet("peak", bal);
+      PrintFormat("Halt cleared. New hard-stop start balance %.2f.", StartBalance());
      }
    UpdatePeak();
    g_trade.SetExpertMagicNumber((ulong)InpMagic);
@@ -818,6 +977,8 @@ void OnDeinit(const int reason)
 
 void OnTick()
   {
+   if(!GlobalVariableCheck(g_gvPrefix + "start") && AccountInfoDouble(ACCOUNT_BALANCE) > 0.0)
+      GvSetFlush("start", AccountInfoDouble(ACCOUNT_BALANCE));
    UpdatePeak();
    CheckHardStop();
    if(SelectMyPosition())
