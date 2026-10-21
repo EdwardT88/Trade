@@ -28,6 +28,7 @@ def main():
     ap.add_argument("--spread-fixed", type=float, default=CostModel.spread_fixed)
     ap.add_argument("--spread-bps", type=float, default=CostModel.spread_bps)
     ap.add_argument("--slippage", type=float, default=CostModel.slippage_stop)
+    ap.add_argument("--swap", type=float, default=CostModel.swap_annual_pct, help="overnight financing %%/yr charged to longs and shorts")
     ap.add_argument("--risk", type=float, default=RiskConfig.risk_pct)
     ap.add_argument("--equity", type=float, default=RiskConfig.initial_equity)
     ap.add_argument("--min-size", type=float, default=RiskConfig.min_size, help="oz; cent=0.01, standard=1.0")
@@ -43,7 +44,7 @@ def main():
     m1 = load_m1(Path(a.data), a.start, a.end)
     t0 = time.time()
     sig = mod.generate_signals(m1, **params)
-    cost = CostModel(spread_fixed=a.spread_fixed, spread_bps=a.spread_bps, slippage_stop=a.slippage)
+    cost = CostModel(spread_fixed=a.spread_fixed, spread_bps=a.spread_bps, slippage_stop=a.slippage, swap_annual_pct=a.swap)
     risk = RiskConfig(risk_pct=a.risk, initial_equity=a.equity, min_size=a.min_size)
     if a.no_limits:
         risk.daily_loss_pct, risk.max_trades_per_day, risk.max_consec_losses_per_day = 1e9, 10**6, 10**6

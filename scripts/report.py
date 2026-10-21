@@ -26,7 +26,7 @@ SPLITS = {
     "val_2024": ("2024-01-01", "2025-01-01"),
     "holdout_2025": ("2025-01-01", "2026-01-01"),
 }
-STRESS = CostModel(spread_fixed=0.40, spread_bps=1.2, slippage_stop=0.10)
+STRESS = CostModel(spread_fixed=0.40, spread_bps=1.2, slippage_stop=0.10, swap_annual_pct=8.0)
 
 
 def no_limits(risk: RiskConfig) -> RiskConfig:
@@ -41,6 +41,7 @@ def main():
     ap.add_argument("--data", default=str(DEFAULT_PARQUET))
     ap.add_argument("--params", default="{}")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--swap", type=float, default=5.0, help="base-case swap %%/yr (0 = swap-free account)")
     a = ap.parse_args()
     out = Path(a.out or f"results/{a.strategy}")
     out.mkdir(parents=True, exist_ok=True)
@@ -55,8 +56,9 @@ def main():
         if m1.empty:
             continue
         sig = mod.generate_signals(m1, **params)
-        base = run_backtest(m1, sig, CostModel(), RiskConfig())
-        raw = run_backtest(m1, sig, CostModel(), no_limits(RiskConfig()))
+        base_cost = CostModel(swap_annual_pct=a.swap)
+        base = run_backtest(m1, sig, base_cost, RiskConfig())
+        raw = run_backtest(m1, sig, base_cost, no_limits(RiskConfig()))
         stress = run_backtest(m1, sig, STRESS, no_limits(RiskConfig()))
         report["splits"][name] = {
             "account": summarize(base, s, e),

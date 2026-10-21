@@ -118,3 +118,13 @@ def test_htf_alignment_has_no_lookahead():
     assert list(entry) == [5, 10, 15, 20]
     al = align_htf_to_m1(m1.index, m5.index, "5min", m5["close"].to_numpy())
     assert np.isnan(al[:5]).all() and al[5] == 4 and al[9] == 4 and al[10] == 9
+
+
+def test_swap_charged_per_rollover_wednesday_triple():
+    # Tue 20:00 -> Thu 20:00 UTC crosses Tue 21:00 (x1) and Wed 21:00 (x3) = 4 nights
+    idx = pd.date_range("2024-01-02 20:00", "2024-01-04 20:00", freq="1h", tz="UTC").as_unit("ns")
+    m1 = pd.DataFrame({"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0}, index=idx)
+    cost = CostModel(spread_fixed=0.0, spread_bps=0.0, rollover_mult=1.0, slippage_stop=0.0, swap_annual_pct=36.5)
+    t = run_backtest(m1, one(0, 1, 1.0, 0.0, exit_idx=len(idx) - 1), cost, LOOSE).trades.iloc[0]
+    # 36.5%/yr = 0.1%/night of $100 = $0.10 per oz per night, 1 oz, 4 nights
+    assert t["swap"] == pytest.approx(0.4) and t["pnl"] == pytest.approx(-0.4)

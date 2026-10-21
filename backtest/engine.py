@@ -37,6 +37,20 @@ class CostModel:
     rollover_hours_utc: tuple = (21, 22)  # inclusive UTC hours treated as rollover
     slippage_stop: float = 0.05       # extra adverse $ on stop / time exits
     commission_per_oz: float = 0.0    # round-trip commission per oz (cent accounts are usually 0)
+    swap_annual_pct: float = 0.0      # overnight financing, % of price per year, charged to longs AND shorts (0 = swap-free)
+    rollover_hour_utc: int = 21       # positions open across this UTC hour pay one night of swap (x3 on Wednesday)
+
+    def rollover_cum(self, index: pd.DatetimeIndex) -> np.ndarray:
+        """Cumulative weighted count of rollovers at or before each bar (weekday nights, Wednesday counts 3)."""
+        t = ns(index)
+        if len(t) == 0:
+            return np.zeros(0)
+        days = pd.date_range(index[0].normalize() - pd.Timedelta(days=1), index[-1].normalize(), freq="D", tz="UTC")
+        days = days[days.dayofweek < 5]
+        events = ns(days + pd.Timedelta(hours=self.rollover_hour_utc))
+        w = np.where(days.dayofweek == 2, 3.0, 1.0)
+        cw = np.concatenate([[0.0], np.cumsum(w)])
+        return cw[np.searchsorted(events, t, side="right")]
 
     def spread_array(self, close: np.ndarray, hours: np.ndarray) -> np.ndarray:
         sp = np.maximum(self.spread_fixed, self.spread_bps * 1e-4 * close)
@@ -106,7 +120,7 @@ def _simulate(open_, high, low, close, spread, day,
               sig_idx, sig_dir, sig_sl, sig_tp, sig_exit, sig_be_r, sig_be_off, sig_trail,
               init_eq, risk_pct, reduced_risk_pct, dd_reduce_pct, max_risk_min_pct,
               min_size, size_step, daily_loss_pct, max_trades_day, max_consec_day,
-              hard_stop_eq, leverage, slip, comm):
+              hard_stop_eq, leverage, slip, comm, roll_cum, swap_rate):
     n = open_.shape[0]
     ns = sig_idx.shape[0]
     status = np.zeros(ns, np.int64)
@@ -120,6 +134,7 @@ def _simulate(open_, high, low, close, spread, day,
     eq_after = np.full(ns, np.nan)
     mae = np.zeros(ns)  # max adverse excursion in $ per oz
     mfe = np.zeros(ns)
+    swap_paid = np.zeros(ns)
 
     equity = init_eq
     peak = init_eq
@@ -274,7 +289,9 @@ def _simulate(open_, high, low, close, spread, day,
             if (dirn > 0 and sl_px > ent - 1e-9) or (dirn < 0 and sl_px < ent + 1e-9):
                 rsn = 5 if trail > 0 else 4
 
-        p = (xp - ent) * dirn * sz - comm * sz
+        sw = sz * (roll_cum[j] - roll_cum[i]) * swap_rate * ent
+        p = (xp - ent) * dirn * sz - comm * sz - sw
+        swap_paid[k] = sw
         status[k] = 0
         exit_i[k] = j
         entry_px[k] = ent
@@ -299,7 +316,7 @@ def _simulate(open_, high, low, close, spread, day,
         if equity <= hard_stop_eq:
             stopped = True
 
-    return status, exit_i, entry_px, exit_px, size, pnl, risk_amt, reason, eq_after, mae, mfe
+    return status, exit_i, entry_px, exit_px, size, pnl, risk_amt, reason, eq_after, mae, mfe, swap_paid
 
 
 @dataclass
@@ -335,8 +352,9 @@ def run_backtest(m1: pd.DataFrame, sig: Signals, cost: CostModel | None = None, 
         float(risk.max_risk_pct_at_min_lot), float(risk.min_size), float(risk.size_step), float(risk.daily_loss_pct),
         int(risk.max_trades_per_day), int(risk.max_consec_losses_per_day), float(risk.hard_stop_equity),
         float(risk.leverage), float(cost.slippage_stop), float(cost.commission_per_oz),
+        cost.rollover_cum(idx), float(cost.swap_annual_pct) / 100.0 / 365.0,
     )
-    status, exit_i, entry_px, exit_px, size, pnl, risk_amt, reason, eq_after, mae, mfe = out
+    status, exit_i, entry_px, exit_px, size, pnl, risk_amt, reason, eq_after, mae, mfe, swap_paid = out
     taken = status == TAKEN
     t = pd.DataFrame({
         "entry_time": idx[sig.entry_idx[taken]],
@@ -354,6 +372,7 @@ def run_backtest(m1: pd.DataFrame, sig: Signals, cost: CostModel | None = None, 
         "equity": eq_after[taken],
         "mae": mae[taken],
         "mfe": mfe[taken],
+        "swap": swap_paid[taken],
         "tag": sig.tag[taken],
         "entry_idx": sig.entry_idx[taken],
         "exit_idx": exit_i[taken],
