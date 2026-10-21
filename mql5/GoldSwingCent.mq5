@@ -45,7 +45,7 @@ input int        InpAtrPeriod          = 14;         // H4 ATR period
 input double     InpStopATR            = 2.0;        // Initial stop = this x ATR(H4)
 input double     InpTrailATR           = 3.0;        // Chandelier trail = this x ATR(H4) at entry (0 = off)
 input ENUM_SIDES InpSides              = SIDES_BOTH; // Directions to trade
-input int        InpMaxHoldDays        = 10;         // Close a position after this many days
+input int        InpMaxHoldDays        = 3;          // Close a position after this many days (3 = ~same profit as 10, shorter trades)
 input bool       InpFridayClose        = true;       // Close everything on Friday (no weekend gaps)
 input int        InpFridayCloseHourUTC = 20;         // ... at this UTC hour
 input int        InpFridayLastEntryUTC = 12;         // No new entries on Friday from this UTC hour

@@ -62,6 +62,21 @@ Grafik equity: `results/swing_pullback/equity.png`. Daftar trade: `results/swing
 
 **Skenario stress** (spread lebih lebar + swap 8%): rata-rata tetap positif (+0.39 / +0.18 / +0.23R).
 
+## Pilihan durasi trade (default EA: maks 3 hari)
+Strategi yang sama, cuma batas lama posisinya yang beda (akun $50, spread + swap 5%):
+
+| Batas lama posisi | 2022–23 | 2024 | 2025 | Rata-rata tahan | Paling lama |
+|---|---|---|---|---|---|
+| Sampai Jumat (versi ujian) | $87.0 | $59.1 | $63.9 | 42 jam | ~5 hari |
+| **Maks 72 jam (default EA)** | **$87.3** | **$57.6** | **$64.4** | **38 jam** | **3 hari** |
+| Maks 48 jam | $79.4 | $51.5 | $60.1 | 32 jam | 2 hari |
+| Maks 36 jam | $68.1 | $51.4 | $60.3 | 27 jam | 1,5 hari |
+| Maks 24 jam | $60.8 | $44.4 | $57.5 | 20 jam | 1 hari |
+| Scalping M5, maks 2 jam | $34.9 (hard stop) | $37.0 | $54.5 | 2 jam | 2 jam |
+
+Batas 72 jam dipilih **setelah** lihat semua data (bukan bagian dari ujian 2025), tapi efeknya kecil: cuma motong
+trade terpanjang, profitnya hampir sama di ketiga periode. Pasang take-profit (1.5R/2R/3R) nggak bikin lebih baik.
+
 ## Yang harus lu tahu (jujur)
 - **Buktinya "lumayan", bukan "pasti".** Gabungan 2022–2025: 174 trade, rata-rata +0.31R, t ≈ 3.1
   (sudah termasuk periode pengembangan). Di 2025 aja t ≈ 1.7.

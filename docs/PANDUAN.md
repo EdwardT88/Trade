@@ -15,9 +15,9 @@ Panduan pasang dan jalanin EA `mql5/GoldSwingCent.mq5` di akun **cent** MT5 deng
   Untuk SELL kebalikannya (nembus 60 ke bawah).
 - **Stop loss:** 2 × ATR(14) H4. Lot dihitung otomatis supaya kalau kena SL ruginya 2% equity.
 - **Trailing stop:** 3 × ATR. Mulai ngunci profit setelah harga jalan sekitar +1 ATR, nggak pernah mundur.
-- **Tutup semua tiap Jumat 20:00 UTC** (Sabtu 03:00 WIB). Nggak bawa posisi lewat weekend.
+- **Posisi maksimal 3 hari**, dan **semua ditutup tiap Jumat 20:00 UTC** (Sabtu 03:00 WIB). Nggak bawa posisi lewat weekend.
 - Nggak buka posisi baru jam 21:00–24:00 UTC (04:00–07:00 WIB, jam spread lebar) dan Jumat setelah 12:00 UTC.
-- Satu posisi dalam satu waktu. Rata-rata ±4 trade per bulan, posisi biasanya ditahan 1–5 hari.
+- Satu posisi dalam satu waktu. Rata-rata ±4 trade per bulan, posisi rata-rata ditahan ±1,5 hari (maks 3 hari).
 
 Jadi ini **swing**, bukan scalping. Scalping udah dites dan kalah sama spread (detail di `docs/HASIL_BACKTEST.md`).
 
@@ -110,6 +110,7 @@ Artinya equity udah turun 30% dari saldo awal. EA nutup semua posisi dan berhent
 | `InpSides` | Long and short | `Long only` = cuma BUY (lebih bagus di 2024–2025, tapi itu taruhan gold terus naik). |
 | `InpStopATR` / `InpTrailATR` | 2.0 / 3.0 | Jarak SL dan trailing (× ATR H4). Jangan diubah tanpa backtest ulang. |
 | `InpTrendEMA` / `InpRsiLevel` | 40 / 40 | Parameter strategi hasil riset. |
+| `InpMaxHoldDays` | 3 | Posisi ditutup paling lama setelah 3 hari. Lebih pendek dari ini profit turun (lihat `docs/HASIL_BACKTEST.md`). |
 | `InpFridayClose` | true | Tutup Jumat 20:00 UTC. |
 | `InpReducedRiskPct` / `InpDDReducePct` | 1.0 / 10 | Risk turun waktu drawdown. |
 | `InpDailyLossPct` / `InpMaxConsecLosses` | 5 / 3 | Rem harian. |
