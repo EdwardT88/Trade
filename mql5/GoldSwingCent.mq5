@@ -100,6 +100,7 @@ string   g_lastSkip      = "";
 string   g_lastSignal    = "";
 datetime g_lastCloseTry  = 0;
 datetime g_lastOrderTry  = 0;
+datetime g_lastExitM1    = 0;   // M1 bar of this EA's last exit (backtest: no new fill in the exit bar)
 
 //+------------------------------------------------------------------+
 //| Time helpers                                                     |
@@ -190,7 +191,11 @@ void GvSetFlush(const string key, const double value)
   }
 void GvDel(const string key)                     { GlobalVariableDel(g_gvPrefix + key); }
 
-double StartBalance() { return GvGet("start", AccountInfoDouble(ACCOUNT_BALANCE)); }
+double StartBalance()
+  {
+   double v = GvGet("start", 0.0);
+   return (v > 0.0) ? v : AccountInfoDouble(ACCOUNT_BALANCE);
+  }
 bool   IsHalted()     { return GvGet("halted", 0.0) > 0.5; }
 
 // peak of CLOSED-trade equity (the backtest sizes against the peak of realized equity)
@@ -294,7 +299,10 @@ void CloseAll(const string why)
       if(PositionGetString(POSITION_SYMBOL) != _Symbol || PositionGetInteger(POSITION_MAGIC) != InpMagic)
          continue;
       if(g_trade.PositionClose(ticket))
+        {
+         g_lastExitM1 = iTime(_Symbol, PERIOD_M1, 0);
          PrintFormat("Closed #%I64u: %s", ticket, why);
+        }
       else
          PrintFormat("Close #%I64u (%s) failed: %u %s", ticket, why, g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription());
      }
@@ -394,6 +402,11 @@ double LotsForRisk(const bool isBuy, const double slDist, double &riskPctUsed)
    double vstep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    if(vstep <= 0.0)
       vstep = vmin;
+   if(vstep <= 0.0 || vmax < vmin)
+     {
+      g_lastSkip = "symbol volume limits not available";
+      return 0.0;
+     }
    double lots = MathFloor(riskMoney / perLot / vstep + 1e-9) * vstep;
    if(lots < vmin)
      {
@@ -408,10 +421,10 @@ double LotsForRisk(const bool isBuy, const double slDist, double &riskPctUsed)
    lots = MathMin(lots, vmax);
    double price = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double margin = 0.0;
-   if(OrderCalcMargin(isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, _Symbol, lots, price, margin)
-      && margin > AccountInfoDouble(ACCOUNT_MARGIN_FREE) * 0.5)
+   if(!OrderCalcMargin(isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, _Symbol, lots, price, margin)
+      || margin > AccountInfoDouble(ACCOUNT_MARGIN_FREE) * 0.5)
      {
-      g_lastSkip = "not enough free margin";
+      g_lastSkip = "margin check failed or not enough free margin";
       return 0.0;
      }
    return NormalizeDouble(lots, VolumeDigits(vstep));
@@ -476,6 +489,13 @@ bool CanOpenNewTrade(string &why)
       why = "position open";
       return false;
      }
+   // netting account: one position per symbol, so an order would merge into a manual / other-EA position
+   if((ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE) != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING
+      && PositionSelect(_Symbol))
+     {
+      why = "netting account: symbol already has another position";
+      return false;
+     }
    MqlDateTime u;
    TimeToStruct(NowUtc(), u);
    if(u.day_of_week == 0 || u.day_of_week == 6)
@@ -483,7 +503,10 @@ bool CanOpenNewTrade(string &why)
       why = "weekend";
       return false;
      }
-   if(u.hour >= InpNoEntryFromUTC && u.hour < InpNoEntryToUTC)
+   bool inNoEntry = (InpNoEntryFromUTC <= InpNoEntryToUTC)
+                    ? (u.hour >= InpNoEntryFromUTC && u.hour < InpNoEntryToUTC)
+                    : (u.hour >= InpNoEntryFromUTC || u.hour < InpNoEntryToUTC);   // window across midnight
+   if(inNoEntry)
      {
       why = "rollover hours";
       return false;
@@ -643,9 +666,13 @@ void CheckEntrySignal()
    datetime h1 = iTime(_Symbol, PERIOD_H1, 0);
    if(h1 == 0 || h1 == g_lastH1Bar)
       return;
-   if(TimeCurrent() - h1 > InpMaxEntryDelayMin * 60)
+   // measured from the SIGNAL bar's close like the backtest; after a gap the current bar is the reopen hour
+   datetime sigOpen = iTime(_Symbol, PERIOD_H1, 1);
+   if(sigOpen == 0)
+      return;   // series not ready: retry on the next tick
+   if(TimeCurrent() - (sigOpen + PeriodSeconds(PERIOD_H1)) > InpMaxEntryDelayMin * 60)
      {
-      g_lastH1Bar = h1;   // too late after the H1 close (weekend, daily break, data hole)
+      g_lastH1Bar = h1;   // too late after the signal bar's close (weekend, daily break, data hole)
       return;
      }
    double rsi[];
@@ -664,6 +691,12 @@ void CheckEntrySignal()
      }
    g_lastSignal = StringFormat("%s %s RSI %.1f->%.1f", TimeToString(h1, TIME_DATE | TIME_MINUTES),
                                longSig ? "LONG" : "SHORT", rsi[1], rsi[0]);
+   if(iTime(_Symbol, PERIOD_M1, 0) <= g_lastExitM1)
+     {
+      g_lastSkip  = "signal skipped: previous trade exited in this minute (backtest: busy)";
+      g_lastH1Bar = h1;
+      return;
+     }
    string why = "";
    if(!CanOpenNewTrade(why))
      {
@@ -829,6 +862,10 @@ void OnClosedDeal(const ulong deal)
    long entry = HistoryDealGetInteger(deal, DEAL_ENTRY);
    if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY)
       return;
+   datetime exitT  = (datetime)HistoryDealGetInteger(deal, DEAL_TIME);
+   datetime exitM1 = (datetime)((long)exitT - (long)exitT % 60);
+   if(exitM1 > g_lastExitM1)
+      g_lastExitM1 = exitM1;
    long posId = HistoryDealGetInteger(deal, DEAL_POSITION_ID);
    if(!SelectMyPosition())
       GvDel(StringFormat("trail_%I64d", posId));
@@ -936,27 +973,38 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
      }
    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
-   if(InpStartBalance > 0.0 && bal > 0.0 && (InpStartBalance < 0.2 * bal || InpStartBalance > 5.0 * bal))
+   g_gvPrefix = StringFormat("GSW_%I64d_%I64d_%s_", AccountInfoInteger(ACCOUNT_LOGIN), InpMagic, _Symbol);
+   if(tester)
+      GlobalVariablesDeleteAll(g_gvPrefix);   // fresh state for every tester pass
+   // InpStartBalance is applied (and unit-checked) only when it is entered or changed: re-applying it on every
+   // init would undo deposit/withdrawal shifts, and the check would refuse a restart after the account grew
+   bool newStartInput = (InpStartBalance > 0.0 && MathAbs(GvGet("start_input", 0.0) - InpStartBalance) > 0.001);
+   if(newStartInput && bal > 0.0 && (InpStartBalance < 0.2 * bal || InpStartBalance > 5.0 * bal))
      {
       Alert(StringFormat("InpStartBalance %.2f looks wrong for balance %.2f %s (cent account: enter USC, e.g. 5000 for $50)",
                          InpStartBalance, bal, AccountInfoString(ACCOUNT_CURRENCY)));
       return INIT_PARAMETERS_INCORRECT;
      }
-   g_gvPrefix = StringFormat("GSW_%I64d_%I64d_%s_", AccountInfoInteger(ACCOUNT_LOGIN), InpMagic, _Symbol);
-   if(tester)
-      GlobalVariablesDeleteAll(g_gvPrefix);   // fresh state for every tester pass
-   if(InpStartBalance > 0.0)
+   if(newStartInput)
+     {
       GvSetFlush("start", InpStartBalance);
+      GvSetFlush("start_input", InpStartBalance);
+     }
    else if(!GlobalVariableCheck(g_gvPrefix + "start") && bal > 0.0)
       GvSetFlush("start", bal);   // if the account is not synchronised yet, OnTick sets it
-   if(InpResetHalt)
+   // one-shot: leaving InpResetHalt = true must not silently clear a later HALT on a restart;
+   // re-armed by any init with InpResetHalt = false
+   if(InpResetHalt && GvGet("reset_armed", 1.0) > 0.5 && bal > 0.0)
      {
-      if(InpStartBalance <= 0.0)
+      if(!newStartInput)
          GvSetFlush("start", bal);   // new baseline, otherwise the EA would halt again on the next tick
       GvSetFlush("halted", 0.0);
       GvSet("peak", bal);
+      GvSetFlush("reset_armed", 0.0);
       PrintFormat("Halt cleared. New hard-stop start balance %.2f.", StartBalance());
      }
+   else if(!InpResetHalt)
+      GvSet("reset_armed", 1.0);
    UpdatePeak();
    g_trade.SetExpertMagicNumber((ulong)InpMagic);
    g_trade.SetDeviationInPoints((ulong)MathMax(1.0, MathRound(InpMaxSlippageUSD / _Point)));
@@ -977,7 +1025,7 @@ void OnDeinit(const int reason)
 
 void OnTick()
   {
-   if(!GlobalVariableCheck(g_gvPrefix + "start") && AccountInfoDouble(ACCOUNT_BALANCE) > 0.0)
+   if(GvGet("start", 0.0) <= 0.0 && AccountInfoDouble(ACCOUNT_BALANCE) > 0.0)
       GvSetFlush("start", AccountInfoDouble(ACCOUNT_BALANCE));
    UpdatePeak();
    CheckHardStop();
