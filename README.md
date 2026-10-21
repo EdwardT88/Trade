@@ -6,6 +6,7 @@ Tujuannya dua: **nggak margin call** dan **akun tumbuh pelan-pelan**.
 - **EA:** `mql5/GoldSwingCent.mq5`. Swing trend-pullback (arah H4, entry H1, SL 2×ATR, trailing 3×ATR, flat tiap Jumat)
   dengan aturan anti-MC yang ketat.
 - **Panduan setup:** [`docs/PANDUAN.md`](docs/PANDUAN.md)
+- ⚠️ **Baca dulu:** edge EA ini nggak terbukti di data 2013–2022 dan rugi di Mei–Sep 2026 (detail di hasil backtest).
 - **Hasil riset & backtest:** [`docs/HASIL_BACKTEST.md`](docs/HASIL_BACKTEST.md) (scalping vs swing, ujian 2025)
 - **Rekomendasi broker:** [`docs/BROKER.md`](docs/BROKER.md)
 

@@ -1,5 +1,20 @@
 # Hasil riset & backtest (XAUUSD, akun cent $50)
 
+> ⚠️ **UPDATE PENTING (Oktober 2026): edge strategi ini TIDAK terbukti dalam jangka panjang.**
+> Setelah dapet data tambahan, strategi yang sama (tanpa diubah) dites ulang:
+>
+> | Periode | Gold, rata-rata per trade |
+> |---|---|
+> | 2013–2015 (gold bear) | +0.05R (132 trade) |
+> | 2016–2019 | +0.03R (181 trade) |
+> | 2020–Mar 2022 | −0.09R (96 trade) |
+> | 2022–2025 (data utama di bawah) | +0.31R (174 trade) |
+> | **Mei–Sep 2026 (data terbaru)** | **−0.37R (18 trade), akun $50 → $44.9** |
+>
+> Di 11 pair FX hasilnya rata-rata minus juga. Kesimpulannya: profit 2022–2025 sebagian besar dari **bull market gold**, bukan
+> keunggulan strategi. **Jangan anggap EA ini mesin profit.** Kalau mau tetap dipakai, perlakukan sebagai eksperimen:
+> demo dulu, risk 1%, uang yang siap hilang. Script cek ulang: `scripts/cross_market_check.py`.
+
 ## TL;DR
 - **Scalping gold (M1–M15) nggak punya edge setelah spread.** Lima gaya scalping dites dengan rapi, dan semuanya ±0R sebelum biaya.
   Setelah spread, semuanya minus, dan di 2025 semuanya rugi 13–22%.
