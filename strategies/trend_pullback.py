@@ -17,15 +17,20 @@ import pandas as pd
 
 from backtest.data import resample
 from backtest.engine import Signals, align_htf_to_m1, htf_close_to_m1_entry, ns
-from backtest.indicators import atr, ema, rolling_max, rolling_min
+from backtest.indicators import atr, ema, rolling_max, rolling_min, rsi
 
 DEFAULT_PARAMS = dict(
     trend_tf="1h", trend_len=50, trend_slope_bars=3,   # HTF trend: close vs EMA and EMA slope
-    fast=20, slow=50,                                   # M5 EMAs: fast = pullback line, fast>slow = M5 trend
+    mom_bars=120,                                       # optional: also require sign(HTF close - close[mom_bars]) (0 = off)
+    entry_tf="5min",                                    # pullback / trigger timeframe
+    fast=20, slow=50,                                   # entry-TF EMAs: fast = pullback line, fast>slow = entry-TF trend
+    pb_mode="ema",                                      # 'ema': touch of fast EMA then close through prev bar extreme
+                                                        # 'rsi': RSI(rsi_len) crosses back out of the dip zone
     pb_bars=6,                                          # pullback must touch the fast EMA within this many M5 bars
+    rsi_len=14, rsi_lo=40,                              # rsi mode: long when RSI crosses up through rsi_lo (short: 100-rsi_lo)
     atr_tf="15min", atr_len=14, sl_atr=1.5,             # stop = sl_atr * ATR(atr_tf)
     tp_r=1.5, be_r=0.0, max_hold_min=90,
-    session="ny",                                       # 'london', 'ny', 'both', 'day'
+    session="day",                                      # 'london', 'ny', 'both', 'day'
     flat_utc=(20, 55),                                  # force flat at this UTC time (before rollover)
 )
 
@@ -47,12 +52,12 @@ def _in_session(times_utc: pd.DatetimeIndex, session: str) -> np.ndarray:
     return ok & (times_utc.dayofweek < 5)
 
 
-def generate_signals(m1: pd.DataFrame, trend_tf="1h", trend_len=50, trend_slope_bars=3, fast=20, slow=50,
-                     pb_bars=6, atr_tf="15min", atr_len=14, sl_atr=1.5, tp_r=1.5, be_r=0.0,
+def generate_signals(m1: pd.DataFrame, trend_tf="1h", trend_len=50, trend_slope_bars=3, mom_bars=0, entry_tf="5min", fast=20, slow=50,
+                     pb_mode="ema", pb_bars=6, rsi_len=14, rsi_lo=40, atr_tf="15min", atr_len=14, sl_atr=1.5, tp_r=1.5, be_r=0.0,
                      max_hold_min=90, session="ny", flat_utc=(20, 55)) -> Signals:
-    m5 = resample(m1, "5min")
+    m5 = resample(m1, entry_tf)  # entry timeframe bars (M5 by default)
     o, h, l, c = (m5[k].to_numpy() for k in ("open", "high", "low", "close"))
-    close_t = pd.DatetimeIndex(m5.index + pd.Timedelta("5min"))  # time at which the M5 bar is complete
+    close_t = pd.DatetimeIndex(m5.index + pd.Timedelta(entry_tf))  # time at which the entry-TF bar is complete
 
     # --- higher-timeframe trend (last completed HTF bar at the M5 close)
     ht = resample(m1, trend_tf)
@@ -60,12 +65,17 @@ def generate_signals(m1: pd.DataFrame, trend_tf="1h", trend_len=50, trend_slope_
     he = ema(hc, trend_len)
     h_up = (hc > he) & (he > np.roll(he, trend_slope_bars))
     h_dn = (hc < he) & (he < np.roll(he, trend_slope_bars))
-    h_up[:trend_len] = False
-    h_dn[:trend_len] = False
+    if mom_bars > 0:  # multi-day momentum agrees with the HTF trend
+        mom = hc - np.roll(hc, mom_bars)
+        h_up &= mom > 0
+        h_dn &= mom < 0
+    warm = max(trend_len, mom_bars, trend_slope_bars)
+    h_up[:warm] = False
+    h_dn[:warm] = False
     trend = align_htf_to_m1(close_t, ht.index, trend_tf, h_up.astype(float) - h_dn.astype(float))
 
     # --- stop distance from ATR of atr_tf (completed bar)
-    if atr_tf == "5min":
+    if atr_tf == entry_tf:
         a = atr(h, l, c, atr_len)
     else:
         at = resample(m1, atr_tf)
@@ -76,14 +86,20 @@ def generate_signals(m1: pd.DataFrame, trend_tf="1h", trend_len=50, trend_slope_
     touched_lo = rolling_min(l - ef, pb_bars) <= 0      # some bar in the window traded at/below the fast EMA
     touched_hi = rolling_max(h - ef, pb_bars) >= 0
     prev_h, prev_l = np.roll(h, 1), np.roll(l, 1)
-    up = (trend > 0) & (ef > es) & touched_lo & (c > ef) & (c > o) & (c > prev_h)
-    dn = (trend < 0) & (ef < es) & touched_hi & (c < ef) & (c < o) & (c < prev_l)
+    if pb_mode == "ema":
+        up = (trend > 0) & (ef > es) & touched_lo & (c > ef) & (c > o) & (c > prev_h)
+        dn = (trend < 0) & (ef < es) & touched_hi & (c < ef) & (c < o) & (c < prev_l)
+    else:  # 'rsi'
+        r = rsi(c, rsi_len)
+        pr = np.roll(r, 1)
+        up = (trend > 0) & (ef > es) & (pr < rsi_lo) & (r >= rsi_lo)
+        dn = (trend < 0) & (ef < es) & (pr > 100 - rsi_lo) & (r <= 100 - rsi_lo)
 
     sig = (up | dn) & _in_session(close_t, session) & np.isfinite(a) & (a > 0)
     sig[: max(slow, pb_bars) + 1] = False
 
     t_m1 = ns(m1.index)
-    entry = htf_close_to_m1_entry(m1.index, m5.index, "5min")[sig]
+    entry = htf_close_to_m1_entry(m1.index, m5.index, entry_tf)[sig]
     direction = np.where(up[sig], 1, -1)
     sl = sl_atr * a[sig]
     keep = entry < len(m1)

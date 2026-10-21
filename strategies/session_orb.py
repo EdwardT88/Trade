@@ -37,6 +37,7 @@ DEFAULT_PARAMS = dict(
     be_r=0.0, be_offset_atr=0.0,
     entry_mode="break",      # "break": enter after the breakout close; "retest": wait for a pullback to the level
     retest_tol_atr=0.05,
+    reentry=False,           # retest mode: re-arm after a failed breakout and allow re-entries on later retests
 )
 
 
@@ -55,7 +56,8 @@ def generate_signals(m1: pd.DataFrame, sessions=("london", "ny"), or_min=15, con
                      entry_window_min=60, buffer_atr=0.0, atr_tf="1h", atr_len=24,
                      min_or_atr=0.25, max_or_atr=1.5, sl_mode="opposite", sl_atr=0.5, sl_buf_atr=0.0,
                      max_sl_atr=1.0, min_sl_atr=0.1, tp_r=1.5, max_hold_min=90, flat_utc=(20, 50),
-                     be_r=0.0, be_offset_atr=0.0, entry_mode="break", retest_tol_atr=0.05) -> Signals:
+                     be_r=0.0, be_offset_atr=0.0, entry_mode="break", retest_tol_atr=0.05,
+                     reentry=False) -> Signals:
     idx = m1.index
     t = ns(idx)
     n = len(t)
@@ -70,11 +72,13 @@ def generate_signals(m1: pd.DataFrame, sessions=("london", "ny"), or_min=15, con
 
     if confirm_tf in ("1min", "1T"):
         cf_close = m1["close"].to_numpy(float)
+        cf_high, cf_low = H, L
         cf_close_t = t + 60 * 10**9                      # bar close time
         cf_entry = np.arange(1, n + 1)                   # fill at next M1 open
     else:
         cf = resample(m1, confirm_tf)
         cf_close = cf["close"].to_numpy(float)
+        cf_high, cf_low = cf["high"].to_numpy(float), cf["low"].to_numpy(float)
         cf_close_t = ns(cf.index + pd.Timedelta(confirm_tf))
         cf_entry = htf_close_to_m1_entry(idx, cf.index, confirm_tf)
 
@@ -103,14 +107,31 @@ def generate_signals(m1: pd.DataFrame, sessions=("london", "ny"), or_min=15, con
             c1 = np.searchsorted(cf_close_t, t_or + entry_window_min * MIN, side="right")
             if c1 <= c0:
                 continue
-            cc = cf_close[c0:c1]
             buf = buffer_atr * a
-            brk = np.flatnonzero((cc > hi + buf) | (cc < lo - buf))
-            if brk.size == 0:
-                continue
-            k = c0 + brk[0]
-            d = 1 if cf_close[k] > hi + buf else -1
+            if entry_mode == "touch":
+                # stop-entry approximation: first completed bar whose high/low trades through the range
+                hh_, ll_ = cf_high[c0:c1], cf_low[c0:c1]
+                up_, dn_ = hh_ > hi + buf, ll_ < lo - buf
+                brk = np.flatnonzero(up_ | dn_)
+                if brk.size == 0 or (up_[brk[0]] and dn_[brk[0]]):
+                    continue
+                k = c0 + brk[0]
+                d = 1 if up_[brk[0]] else -1
+            else:
+                cc = cf_close[c0:c1]
+                brk = np.flatnonzero((cc > hi + buf) | (cc < lo - buf))
+                if brk.size == 0:
+                    continue
+                k = c0 + brk[0]
+                d = 1 if cf_close[k] > hi + buf else -1
             ei = int(cf_entry[k])
+            if entry_mode == "retest" and reentry:
+                j1 = min(int(np.searchsorted(t, t_or + entry_window_min * MIN, side="left")), n)
+                for v in _retest_all(C[e:j1], H[e:j1], L[e:j1], hi, lo, retest_tol_atr * a):
+                    _emit(rows, e + abs(v), 1 if v > 0 else -1, O, t, a, hi, lo, n, t_flat, sl_mode, sl_atr,
+                          sl_buf_atr, max_sl_atr, min_sl_atr, tp_r, max_hold_min, be_offset_atr,
+                          SESSION_TAG[name], MIN)
+                continue
             if entry_mode == "retest":
                 # M1 bars after the breakout, until the window end: cancel if a bar closes back inside the
                 # range; enter after the first bar that touches the broken level and closes beyond it
@@ -127,23 +148,8 @@ def generate_signals(m1: pd.DataFrame, sessions=("london", "ny"), or_min=15, con
                         break
                 if ei < 0:
                     continue
-            if ei >= n or t[ei] >= t_flat:
-                continue
-            px = O[ei]
-            if sl_mode == "opposite":
-                lvl = lo if d > 0 else hi
-                sl = (px - lvl) * d + sl_buf_atr * a
-            elif sl_mode == "mid":
-                lvl = 0.5 * (hi + lo)
-                sl = (px - lvl) * d + sl_buf_atr * a
-            else:
-                sl = sl_atr * a
-            if sl > max_sl_atr * a:
-                continue
-            sl = max(sl, min_sl_atr * a)
-            t_exit = min(t[ei] + max_hold_min * MIN, t_flat)
-            xi = int(np.searchsorted(t, t_exit, side="left"))
-            rows.append((ei, d, sl, tp_r * sl, xi, be_offset_atr * a, SESSION_TAG[name]))
+            _emit(rows, ei, d, O, t, a, hi, lo, n, t_flat, sl_mode, sl_atr, sl_buf_atr, max_sl_atr,
+                  min_sl_atr, tp_r, max_hold_min, be_offset_atr, SESSION_TAG[name], MIN)
 
     if not rows:
         return Signals.empty()
@@ -154,6 +160,54 @@ def generate_signals(m1: pd.DataFrame, sessions=("london", "ny"), or_min=15, con
     return Signals(r[:, 0].astype(np.int64), r[:, 1].astype(np.int64), r[:, 2], r[:, 3],
                    exit_idx=r[:, 4].astype(np.int64), be_trigger_r=np.full(m, be_r), be_offset=r[:, 5],
                    tag=r[:, 6].astype(np.int64))
+
+
+def _emit(rows, ei, d, O, t, a, hi, lo, n, t_flat, sl_mode, sl_atr, sl_buf_atr, max_sl_atr, min_sl_atr,
+          tp_r, max_hold_min, be_offset_atr, tag, MIN):
+    if ei >= n or t[ei] >= t_flat:
+        return
+    px = O[ei]
+    if sl_mode == "opposite":
+        lvl = lo if d > 0 else hi
+        sl = (px - lvl) * d + sl_buf_atr * a
+    elif sl_mode == "mid":
+        lvl = 0.5 * (hi + lo)
+        sl = (px - lvl) * d + sl_buf_atr * a
+    else:
+        sl = sl_atr * a
+    if sl > max_sl_atr * a:
+        return
+    sl = max(sl, min_sl_atr * a)
+    t_exit = min(t[ei] + max_hold_min * MIN, t_flat)
+    xi = int(np.searchsorted(t, t_exit, side="left"))
+    rows.append((ei, d, sl, tp_r * sl, xi, be_offset_atr * a, tag))
+
+
+def _retest_all(C, H, L, hi, lo, tol):
+    """State machine over M1 bars after the range: a close beyond a side arms that direction; a close
+    back inside disarms; while armed, a bar that touches the broken level and closes beyond it is a
+    retest signal (entry at the next bar). Returns signed offsets (+long/-short) of the signal bars."""
+    out = []
+    d = 0
+    for j in range(len(C)):
+        c = C[j]
+        if d == 0:
+            if c > hi:
+                d = 1
+            elif c < lo:
+                d = -1
+            continue
+        lvl = hi if d > 0 else lo
+        if (c - lvl) * d <= 0:
+            d = 0
+            if c > hi:
+                d = 1
+            elif c < lo:
+                d = -1
+            continue
+        if (d > 0 and L[j] <= lvl + tol) or (d < 0 and H[j] >= lvl - tol):
+            out.append(d * (j + 1))  # signal bar j -> entry at offset j+1 (never 0)
+    return out
 
 
 SESSION_TAG = {"london": 1, "comex": 2, "ny": 3}
