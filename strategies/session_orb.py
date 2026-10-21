@@ -19,25 +19,25 @@ SESSIONS = {
 }
 
 DEFAULT_PARAMS = dict(
-    sessions=("london", "ny"),
-    or_min=15,               # opening range = first N minutes after the session open
-    confirm_tf="1min",       # breakout = a completed bar of this TF closes beyond the range
-    entry_window_min=60,     # breakout must be confirmed within this many minutes after the range ends
-    buffer_atr=0.0,          # close must exceed the range by this many ATR
-    atr_tf="1h", atr_len=24,  # volatility yardstick (last completed bar at range end)
-    min_or_atr=0.25, max_or_atr=1.5,  # range width filter, in ATR
-    sl_mode="opposite",      # "opposite" | "mid" | "atr"
-    sl_atr=0.5,              # stop distance when sl_mode == "atr"
-    sl_buf_atr=0.0,          # extra distance beyond the structural stop level
-    max_sl_atr=1.0,          # skip the trade if the stop is wider than this (in ATR)
-    min_sl_atr=0.1,          # floor for the stop distance (in ATR)
-    tp_r=1.5,
-    max_hold_min=90,
-    flat_utc=(20, 50),       # never hold past this UTC clock time
+    sessions=("ny",),        # New York equities open 09:30 America/New_York (13:30 UTC summer / 14:30 UTC winter)
+    or_min=15,               # opening range = first 15 minutes after the open
+    confirm_tf="1min",       # breakout = a completed M1 bar closes beyond the range
+    entry_window_min=60,     # breakout and retest must happen within 60 minutes after the range ends
+    buffer_atr=0.0,          # close must exceed the range by this many ATR (0 = any close beyond)
+    atr_tf="1h", atr_len=24,  # volatility yardstick: H1 ATR(24) of the last completed H1 bar
+    min_or_atr=0.25, max_or_atr=1.5,  # trade only if 0.25*ATR <= range width <= 1.5*ATR
+    entry_mode="retest",     # wait for a pullback to the broken level that holds, then enter
+    retest_tol_atr=0.05,     # "touch" = bar low within 0.05*ATR above the level (long) / high within below (short)
+    reentry=False,           # only the first retest of the session is traded
+    sl_mode="opposite",      # stop at the opposite side of the opening range
+    sl_atr=0.5,              # (only for sl_mode="atr")
+    sl_buf_atr=0.0,
+    max_sl_atr=1.5,          # skip if the stop would be wider than 1.5*ATR
+    min_sl_atr=0.1,
+    tp_r=1.5,                # target = 1.5 x stop distance
+    max_hold_min=90,         # time exit
+    flat_utc=(20, 50),       # never hold past 20:50 UTC
     be_r=0.0, be_offset_atr=0.0,
-    entry_mode="break",      # "break": enter after the breakout close; "retest": wait for a pullback to the level
-    retest_tol_atr=0.05,
-    reentry=False,           # retest mode: re-arm after a failed breakout and allow re-entries on later retests
 )
 
 
@@ -52,12 +52,12 @@ def _session_opens(dates: pd.DatetimeIndex, zone: str, hh: int, mm: int) -> np.n
     return np.asarray(sorted(set(out)), dtype=np.int64)
 
 
-def generate_signals(m1: pd.DataFrame, sessions=("london", "ny"), or_min=15, confirm_tf="1min",
+def generate_signals(m1: pd.DataFrame, sessions=("ny",), or_min=15, confirm_tf="1min",
                      entry_window_min=60, buffer_atr=0.0, atr_tf="1h", atr_len=24,
-                     min_or_atr=0.25, max_or_atr=1.5, sl_mode="opposite", sl_atr=0.5, sl_buf_atr=0.0,
-                     max_sl_atr=1.0, min_sl_atr=0.1, tp_r=1.5, max_hold_min=90, flat_utc=(20, 50),
-                     be_r=0.0, be_offset_atr=0.0, entry_mode="break", retest_tol_atr=0.05,
-                     reentry=False) -> Signals:
+                     min_or_atr=0.25, max_or_atr=1.5, entry_mode="retest", retest_tol_atr=0.05,
+                     reentry=False, sl_mode="opposite", sl_atr=0.5, sl_buf_atr=0.0,
+                     max_sl_atr=1.5, min_sl_atr=0.1, tp_r=1.5, max_hold_min=90, flat_utc=(20, 50),
+                     be_r=0.0, be_offset_atr=0.0) -> Signals:
     idx = m1.index
     t = ns(idx)
     n = len(t)

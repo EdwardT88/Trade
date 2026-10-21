@@ -1,4 +1,8 @@
-"""Trend pullback scalp for XAUUSD (research module, see results/trend_pullback_dev.md).
+"""Trend pullback scalp for XAUUSD (research module).
+
+RESEARCH RESULT: NOT VIABLE. Raw (zero-cost) edge is only ~+0.03R per trade on 2022-2023 and on 2024;
+after the default costs (~0.07-0.08R per trade) every tested variant loses (about -0.04 to -0.08R).
+Do not trade this live. Kept as a documented negative result.
 
 Idea: trade only in the direction of the higher-timeframe trend, wait for a short pullback on M5
 into the fast EMA, and enter when an M5 bar closes back in the trend direction through the
