@@ -41,7 +41,10 @@ def generate_signals(bars: pd.DataFrame, sym: str = "", atr_n=96, look_ny="15:00
     a = atr(h, lo, c, atr_n)
 
     # New York calendar days (Mon-Thu evenings; Friday evening the market is closed, Sunday has no 15:00 bar)
-    ny_days = pd.DatetimeIndex(np.unique(idx.tz_convert("America/New_York").normalize()))
+    if n == 0:
+        return Signals.empty()
+    d0, d1 = (x.tz_convert("America/New_York").tz_localize(None).normalize() for x in (idx[0], idx[-1]))
+    ny_days = pd.date_range(d0, d1, freq="D")
     ny_days = ny_days[ny_days.dayofweek <= 3]
     sig_t = _local(ny_days, signal_ny, "America/New_York")   # signal = close of the bar ending here
     look_t = _local(ny_days, look_ny, "America/New_York")
