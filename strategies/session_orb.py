@@ -1,6 +1,24 @@
-"""Session opening-range breakout (ORB) scalper for XAUUSD.
+"""Session opening-range breakout (ORB) with retest, XAUUSD, New York open.
 
-Draft under research -- see results/session_orb_dev.md for the log.
+Research verdict (results/session_orb_dev.md): weak and NOT statistically significant.
+Plain ORB breakouts at the London, COMEX and NY opens lose money after costs in 2022-2023; only the
+"first retest of the NY 09:30 range" variant below was positive (+0.08 R/trade dev, +0.06 R/trade 2024,
+t ~ 1), at only ~7-10 trades/month.
+
+Default rules (all prices BID, all times DST-aware):
+1. Session open T0 = 09:30 America/New_York (13:30 UTC in US summer time, 14:30 UTC in winter), Mon-Fri.
+2. Opening range (OR) = high/low of the M1 bars in [T0, T0+15 min). Skip the day if fewer than 12 bars.
+3. ATR = iATR(H1, 24) of the last *completed* H1 bar at T0+15 (simple average of true range).
+   Trade only if 0.25*ATR <= OR width <= 1.5*ATR.
+4. Breakout: the first completed M1 bar (closing at or before T0+15+60 min) whose close is above OR high
+   (long) or below OR low (short). Only the first breakout of the day counts.
+5. Retest: on the M1 bars after the breakout bar (until T0+15+60 min): if a bar closes back inside the
+   range (long: close <= OR high), cancel for the day. Otherwise the first bar whose low <= OR high +
+   0.05*ATR (long) / high >= OR low - 0.05*ATR (short) and that closes beyond the level is the signal;
+   enter at market on the open of the next M1 bar.
+6. Stop distance d = |bid at entry - opposite side of the OR| (long: bid - OR low; short: OR high - bid).
+   Skip if d > 1.5*ATR. Long SL = fill - d, short SL = fill + d. TP = fill +/- 1.5*d.
+7. Close at market after 90 minutes (and never later than 20:50 UTC). One trade per day, one position.
 """
 from zoneinfo import ZoneInfo
 
@@ -17,6 +35,7 @@ SESSIONS = {
     "comex": ("America/New_York", 8, 20),   # 12:20 UTC (EDT) / 13:20 UTC (EST)
     "ny": ("America/New_York", 9, 30),      # 13:30 UTC (EDT) / 14:30 UTC (EST)
 }
+SESSION_TAG = {"london": 1, "comex": 2, "ny": 3}  # Signals.tag
 
 DEFAULT_PARAMS = dict(
     sessions=("ny",),        # New York equities open 09:30 America/New_York (13:30 UTC summer / 14:30 UTC winter)
@@ -101,9 +120,8 @@ def generate_signals(m1: pd.DataFrame, sessions=("ny",), or_min=15, confirm_tf="
                 continue
             day0 = t0 - t0 % (86_400 * 10**9)
             t_flat = day0 + (flat_utc[0] * 60 + flat_utc[1]) * MIN
-            # completed confirm bars that close inside the entry window
-            c0, c1 = np.searchsorted(cf_close_t, [t_or, t_or + entry_window_min * MIN], side="left")
-            # include a bar closing exactly at the window end
+            # completed confirm bars that close within [range end, range end + window]
+            c0 = np.searchsorted(cf_close_t, t_or, side="left")
             c1 = np.searchsorted(cf_close_t, t_or + entry_window_min * MIN, side="right")
             if c1 <= c0:
                 continue
@@ -208,6 +226,3 @@ def _retest_all(C, H, L, hi, lo, tol):
         if (d > 0 and L[j] <= lvl + tol) or (d < 0 and H[j] >= lvl - tol):
             out.append(d * (j + 1))  # signal bar j -> entry at offset j+1 (never 0)
     return out
-
-
-SESSION_TAG = {"london": 1, "comex": 2, "ny": 3}
