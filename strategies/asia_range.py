@@ -26,21 +26,24 @@ MIN = 60 * 10**9
 TAG_BO, TAG_FADE = 1, 2
 
 DEFAULT_PARAMS = dict(
-    mode="fade",             # "bo", "fade" or "both"
-    asia_start_utc=0,        # range starts at 00:00 true UTC (Tokyo 09:00, no DST)
+    mode="fade",             # "bo", "fade" or "bo+fade"
+    asia_start_utc=0,        # range starts at 00:00 true UTC (Tokyo 09:00, no DST) and ends at the London open
     window_min=180,          # trade signals from the London open (08:00 Europe/London) for 180 minutes
     atr_tf="1h", atr_len=24,  # volatility yardstick: H1 ATR(24) of the last H1 bar completed before the London open
     min_w_atr=0.0, max_w_atr=99.0,  # range-width filter in ATR units
-    # breakout
-    bo_buf_atr=0.0,          # M5 close must exceed the range by this many ATR
-    bo_sl_atr=1.0,           # breakout stop distance in ATR
-    # fade
-    sweep_min_atr=0.0,       # high must exceed the range by more than this to count as a sweep
-    max_ext_atr=1.0,         # if price ran further than this beyond the range it is a real breakout: no fade
-    max_sweep_bars=6,        # the M5 close back inside must come within this many M5 bars of the first sweep bar
-    sl_buf_atr=0.1,          # fade stop = sweep extreme + buffer
-    min_sl_atr=0.25, max_sl_atr=1.5,
+    sl_atr=1.0,              # stop distance in ATR for breakouts and "break" fades
     tp_r=1.5,                # target = tp_r x stop distance
+    # breakout continuation
+    bo_start_min=0,          # ignore breakouts in the first N minutes after the London open (opening stop-hunts)
+    bo_buf_atr=0.0,          # M5 close must exceed the range by this many ATR
+    # fade
+    fade_trigger="reclaim",  # "reclaim": sweep then M5 close back inside; "break": fade the first M5 close beyond
+    fade_end_min=180,        # fade triggers only within the first N minutes after the London open
+    sweep_min_atr=0.0,       # (reclaim) high must exceed the range by more than this to count as a sweep
+    max_ext_atr=1.0,         # (reclaim) if price ran further than this beyond the range it is a real breakout
+    max_sweep_bars=6,        # (reclaim) the close back inside must come within this many M5 bars of the sweep
+    sl_buf_atr=0.1,          # (reclaim) stop = sweep extreme + buffer
+    min_sl_atr=0.25, max_sl_atr=1.5,
     max_hold_min=90,         # time exit
     flat_utc=(20, 50),       # never hold past 20:50 true UTC
     data_clock="ny+5",
@@ -72,10 +75,10 @@ def _day_events(dates, asia_start_utc, window_min, flat_utc, clock):
 
 
 def generate_signals(m1: pd.DataFrame, mode="fade", asia_start_utc=0, window_min=180, atr_tf="1h", atr_len=24,
-                     min_w_atr=0.0, max_w_atr=99.0, bo_buf_atr=0.0, bo_sl_atr=1.0,
-                     sweep_min_atr=0.0, max_ext_atr=1.0, max_sweep_bars=6, sl_buf_atr=0.1,
-                     min_sl_atr=0.25, max_sl_atr=1.5, tp_r=1.5, max_hold_min=90, flat_utc=(20, 50),
-                     data_clock="ny+5") -> Signals:
+                     min_w_atr=0.0, max_w_atr=99.0, sl_atr=1.0, tp_r=1.5, bo_start_min=0, bo_buf_atr=0.0,
+                     fade_trigger="reclaim", fade_end_min=180, sweep_min_atr=0.0, max_ext_atr=1.0,
+                     max_sweep_bars=6, sl_buf_atr=0.1, min_sl_atr=0.25, max_sl_atr=1.5, max_hold_min=90,
+                     flat_utc=(20, 50), data_clock="ny+5") -> Signals:
     idx = m1.index
     t = ns(idx)
     n = len(t)
@@ -96,8 +99,8 @@ def generate_signals(m1: pd.DataFrame, mode="fade", asia_start_utc=0, window_min
     # ATR of the last HTF bar completed at the London open
     A = align_htf_to_m1(pd.DatetimeIndex(pd.to_datetime(lo_t, unit="ns", utc=True)), ht.index, atr_tf, a_ht)
 
-    do_bo = mode in ("bo", "both")
-    do_fade = mode in ("fade", "both")
+    do_bo = "bo" in mode
+    do_fade = "fade" in mode
     rows = []
 
     def emit(k, d, sl, tag, t_flat):
@@ -129,34 +132,45 @@ def generate_signals(m1: pd.DataFrame, mode="fade", asia_start_utc=0, window_min
         if do_bo:
             lvl_up, lvl_dn = hi + bo_buf_atr * a, lo - bo_buf_atr * a
             done_up = done_dn = False
-            for k in range(k0, k1):
+            kb = int(np.searchsorted(o5, lo_t[di] + bo_start_min * MIN, side="left"))
+            for k in range(max(kb, 1), k1):
                 if not done_up and c5[k] > lvl_up and c5[k - 1] <= lvl_up:
-                    emit(k, 1, bo_sl_atr * a, TAG_BO, t_flat)
+                    emit(k, 1, sl_atr * a, TAG_BO, t_flat)
                     done_up = True
                 if not done_dn and c5[k] < lvl_dn and c5[k - 1] >= lvl_dn:
-                    emit(k, -1, bo_sl_atr * a, TAG_BO, t_flat)
+                    emit(k, -1, sl_atr * a, TAG_BO, t_flat)
                     done_dn = True
 
-        if do_fade:
+        if do_fade and fade_trigger == "break":
+            # fade the first fresh M5 close beyond each side inside the early window
+            kf = int(np.searchsorted(ct5, lo_t[di] + fade_end_min * MIN, side="right"))
+            done_up = done_dn = False
+            for k in range(k0, min(kf, k1)):
+                if not done_up and c5[k] > hi and c5[k - 1] <= hi:
+                    emit(k, -1, sl_atr * a, TAG_FADE, t_flat)
+                    done_up = True
+                if not done_dn and c5[k] < lo and c5[k - 1] >= lo:
+                    emit(k, 1, sl_atr * a, TAG_FADE, t_flat)
+                    done_dn = True
+
+        if do_fade and fade_trigger == "reclaim":
             # short after a sweep of the Asian high, long after a sweep of the Asian low
+            kf = int(np.searchsorted(ct5, lo_t[di] + fade_end_min * MIN, side="right"))
             for d, lvl in ((-1, hi), (1, lo)):
                 armed_k = -1
                 ext = lvl
-                for k in range(k0, k1):
+                for k in range(k0, min(kf, k1)):
                     beyond = (h5[k] - lvl) if d < 0 else (lvl - l5[k])
                     if armed_k < 0 and beyond > sweep_min_atr * a:
                         armed_k = k
                     if armed_k < 0:
                         continue
                     ext = max(ext, h5[k]) if d < 0 else min(ext, l5[k])
-                    if k - armed_k > max_sweep_bars:
+                    if k - armed_k > max_sweep_bars or abs(ext - lvl) > max_ext_atr * a:
                         break
-                    if abs(ext - lvl) > max_ext_atr * a:
-                        break
-                    inside = c5[k] < lvl if d < 0 else c5[k] > lvl
-                    if inside:
-                        stop = ext + d * -1 * sl_buf_atr * a  # beyond the extreme
-                        sl = (stop - c5[k]) * -d
+                    if (c5[k] < lvl) if d < 0 else (c5[k] > lvl):
+                        stop = ext - d * sl_buf_atr * a  # beyond the sweep extreme
+                        sl = (c5[k] - stop) * d
                         if sl > max_sl_atr * a:
                             break
                         emit(k, d, max(sl, min_sl_atr * a), TAG_FADE, t_flat)
