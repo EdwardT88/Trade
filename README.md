@@ -3,6 +3,8 @@
 MT5 Expert Advisor + riset backtest buat trading gold (XAUUSD) di akun **cent** dengan modal kecil.
 Tujuannya dua: **nggak margin call** dan **akun tumbuh pelan-pelan**.
 
+- **RiskGuard (buat trading manual):** `mql5/RiskGuardCent.mq5`. Lot calculator 1 klik, SL wajib, risk maks per
+  posisi, batas harian, cooldown, hard stop. Panduan: [`docs/RISK_GUARD.md`](docs/RISK_GUARD.md)
 - **EA:** `mql5/GoldSwingCent.mq5`. Swing trend-pullback (arah H4, entry H1, SL 2×ATR, trailing 3×ATR, flat tiap Jumat)
   dengan aturan anti-MC yang ketat.
 - **Panduan setup:** [`docs/PANDUAN.md`](docs/PANDUAN.md)
