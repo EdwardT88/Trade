@@ -16,7 +16,7 @@ import pandas as pd  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backtest.data import DEFAULT_PARQUET, load_m1  # noqa: E402
-from backtest.engine import CostModel, RiskConfig, run_backtest  # noqa: E402
+from backtest.engine import CostModel, RiskConfig, Signals, run_backtest  # noqa: E402
 from backtest.metrics import r_by_hour, summarize  # noqa: E402
 from backtest.montecarlo import monte_carlo  # noqa: E402
 from strategies import load  # noqa: E402
@@ -27,6 +27,17 @@ SPLITS = {
     "holdout_2025": ("2025-01-01", "2026-01-01"),
 }
 STRESS = CostModel(spread_fixed=0.40, spread_bps=1.2, slippage_stop=0.10, swap_annual_pct=8.0)
+
+
+WARMUP = pd.Timedelta(days=60)
+
+
+def keep_from(sig: Signals, index: pd.DatetimeIndex, start: pd.Timestamp) -> Signals:
+    sig = sig.finalize()
+    keep = index[sig.entry_idx] >= start
+    for f in ("entry_idx", "direction", "sl_dist", "tp_dist", "exit_idx", "be_trigger_r", "be_offset", "trail_dist", "tag"):
+        setattr(sig, f, getattr(sig, f)[keep])
+    return sig
 
 
 def no_limits(risk: RiskConfig) -> RiskConfig:
@@ -52,10 +63,13 @@ def main():
     report = {"strategy": a.strategy, "params": params, "splits": {}}
     curves = {}
     for name, (s, e) in SPLITS.items():
-        m1 = full[(full.index >= pd.Timestamp(s, tz="UTC")) & (full.index < pd.Timestamp(e, tz="UTC"))]
-        if m1.empty:
+        t0, t1 = pd.Timestamp(s, tz="UTC"), pd.Timestamp(e, tz="UTC")
+        if not ((full.index >= t0) & (full.index < t1)).any():
             continue
-        sig = mod.generate_signals(m1, **params)
+        # indicators warm up on the preceding WARMUP of data (as a live EA would have history);
+        # only trades entered inside [s, e) are counted
+        m1 = full[(full.index >= t0 - WARMUP) & (full.index < t1)]
+        sig = keep_from(mod.generate_signals(m1, **params), m1.index, t0)
         base_cost = CostModel(swap_annual_pct=a.swap)
         base = run_backtest(m1, sig, base_cost, RiskConfig())
         raw = run_backtest(m1, sig, base_cost, no_limits(RiskConfig()))

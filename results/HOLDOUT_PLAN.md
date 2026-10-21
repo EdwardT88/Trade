@@ -30,3 +30,25 @@ Otherwise: do not deploy as a validated strategy; report the result honestly.
 Secondary candidates (`swing_breakout`, `swing_ma_regime` if viable) are evaluated with the
 same rule and reported, but cannot replace the primary on the basis of 2025 alone
 (choosing the best of several on the holdout would turn it into another in-sample test).
+
+---
+
+## Result (run after the rule above was committed)
+
+Corrected (true-UTC) data, 60-day indicator warm-up, default spread, swap 5%/yr, $50 cent account,
+default risk rules. Full numbers: `results/<strategy>/summary.json`, trades in `trades_*.csv`.
+
+| Strategy | 2022–23 avg R | 2024 avg R | **2025 avg R** | 2025 trades | 2025 account | 2025 max DD | Hard stop |
+|---|---|---|---|---|---|---|---|
+| **swing_pullback (primary)** | +0.42 | +0.21 | **+0.26** | 53 | **+27.9%** | 9.9% | no |
+| swing_breakout | +0.16 | +0.19 | +0.33 | 44 | +21.3% | 15.4% | no |
+| swing_ma_regime | +0.20 | +0.08 | +0.11 | 58 | +9.0% | 13.0% | no |
+
+**Decision: swing_pullback passes all three criteria → deployed in `mql5/GoldSwingCent.mq5`.**
+
+Caveats: shorts lost in 2024 (−0.52R, 15 trades) and 2025 (−0.13R, 16 trades), both strong gold bull
+years; longs carried the result. Default stays long+short as pre-registered; `InpSides` allows long-only.
+Pooled 2022–2025: 174 trades, +0.31R/trade, SE 0.10 (includes the in-sample dev period).
+
+Scalping archetypes on 2025 (information only, swap 0): trend_pullback −15.0%, session_orb −22.3%,
+asia_range −16.5%, mean_reversion −12.7%, momentum_breakout −13.9% (account returns).

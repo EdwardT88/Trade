@@ -33,30 +33,33 @@ EXIT_NAMES = {1: "sl", 2: "tp", 3: "time", 4: "breakeven", 5: "trail", 6: "end_o
 class CostModel:
     spread_fixed: float = 0.25        # minimum spread in $ (price units)
     spread_bps: float = 0.80          # spread as basis points of price; spread = max(fixed, bps * price)
-    rollover_mult: float = 3.0        # spread multiplier during the daily rollover window
-    rollover_hours_utc: tuple = (21, 22)  # inclusive UTC hours treated as rollover
+    rollover_mult: float = 3.0        # spread multiplier around the daily rollover (17:00 New York)
+    rollover_window_ny: tuple = (16 * 60 + 30, 18 * 60 + 30)  # [start, end) minutes of New York time
     slippage_stop: float = 0.05       # extra adverse $ on stop / time exits
     commission_per_oz: float = 0.0    # round-trip commission per oz (cent accounts are usually 0)
     swap_annual_pct: float = 0.0      # overnight financing, % of price per year, charged to longs AND shorts (0 = swap-free)
-    rollover_hour_utc: int = 21       # positions open across this UTC hour pay one night of swap (x3 on Wednesday)
+    # positions open across 17:00 New York (the daily rollover) pay one night of swap, x3 on Wednesday
 
     def rollover_cum(self, index: pd.DatetimeIndex) -> np.ndarray:
         """Cumulative weighted count of rollovers at or before each bar (weekday nights, Wednesday counts 3)."""
         t = ns(index)
         if len(t) == 0:
             return np.zeros(0)
-        days = pd.date_range(index[0].normalize() - pd.Timedelta(days=1), index[-1].normalize(), freq="D", tz="UTC")
+        start = index[0].tz_convert("America/New_York").normalize() - pd.Timedelta(days=1)
+        end = index[-1].tz_convert("America/New_York").normalize() + pd.Timedelta(days=1)
+        days = pd.date_range(start.tz_localize(None), end.tz_localize(None), freq="D")
         days = days[days.dayofweek < 5]
-        events = ns(days + pd.Timedelta(hours=self.rollover_hour_utc))
+        events = ns((days + pd.Timedelta(hours=17)).tz_localize("America/New_York").tz_convert("UTC"))
         w = np.where(days.dayofweek == 2, 3.0, 1.0)
         cw = np.concatenate([[0.0], np.cumsum(w)])
         return cw[np.searchsorted(events, t, side="right")]
 
-    def spread_array(self, close: np.ndarray, hours: np.ndarray) -> np.ndarray:
+    def spread_array(self, close: np.ndarray, index: pd.DatetimeIndex) -> np.ndarray:
         sp = np.maximum(self.spread_fixed, self.spread_bps * 1e-4 * close)
-        lo, hi = self.rollover_hours_utc
-        sp = np.where((hours >= lo) & (hours <= hi), sp * self.rollover_mult, sp)
-        return sp
+        ny = index.tz_convert("America/New_York")
+        mins = ny.hour.to_numpy() * 60 + ny.minute.to_numpy()
+        lo, hi = self.rollover_window_ny
+        return np.where((mins >= lo) & (mins < hi), sp * self.rollover_mult, sp)
 
 
 @dataclass
@@ -340,8 +343,7 @@ def run_backtest(m1: pd.DataFrame, sig: Signals, cost: CostModel | None = None, 
     high = m1["high"].to_numpy(float)
     low = m1["low"].to_numpy(float)
     close = m1["close"].to_numpy(float)
-    hours = idx.hour.to_numpy()
-    spread = cost.spread_array(close, hours)
+    spread = cost.spread_array(close, idx)
     day = (ns(idx) // (86_400 * 10**9)).astype(np.int64)
 
     out = _simulate(

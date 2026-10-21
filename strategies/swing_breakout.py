@@ -89,7 +89,10 @@ def generate_signals(m1: pd.DataFrame, tf_min=240, bar_offset_h=2, lookback=20, 
                      fri_close=False, fri_exit_h=20, fri_cutoff_h=12, sides="both", max_atr_pct=0.0) -> Signals:
     t = ns(m1.index)
     n_m1 = len(t)
-    b = _bars(m1, t, int(tf_min), bar_offset_h)
+    # bar clock = New York wall time + 5 h + bar_offset_h (bar_offset_h=2 -> NY-close server time, GMT+2/+3);
+    # data/ is true UTC (see backtest/data.py), so derive New York wall time explicitly
+    t_clock = ns(m1.index.tz_convert("America/New_York").tz_localize(None)) + 5 * _NS_H
+    b = _bars(m1, t_clock, int(tf_min), bar_offset_h)
     h, lo, c, end = b["high"], b["low"], b["close"], b["end"]
     nb = len(c)
 
@@ -111,7 +114,7 @@ def generate_signals(m1: pd.DataFrame, tf_min=240, bar_offset_h=2, lookback=20, 
         t_up[:trend_len] = False
         t_dn[:trend_len] = False
     elif trend == "d1_ema":
-        d = _bars(m1, t, 1440, bar_offset_h)
+        d = _bars(m1, t_clock, 1440, bar_offset_h)
         de = ema(d["close"], trend_len)
         d_up = d["close"] > de
         d_dn = d["close"] < de

@@ -121,10 +121,18 @@ def test_htf_alignment_has_no_lookahead():
 
 
 def test_swap_charged_per_rollover_wednesday_triple():
-    # Tue 20:00 -> Thu 20:00 UTC crosses Tue 21:00 (x1) and Wed 21:00 (x3) = 4 nights
+    # Tue 20:00 -> Thu 20:00 UTC (January: 17:00 New York = 22:00 UTC) crosses Tue (x1) and Wed (x3) = 4 nights
     idx = pd.date_range("2024-01-02 20:00", "2024-01-04 20:00", freq="1h", tz="UTC").as_unit("ns")
     m1 = pd.DataFrame({"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0}, index=idx)
     cost = CostModel(spread_fixed=0.0, spread_bps=0.0, rollover_mult=1.0, slippage_stop=0.0, swap_annual_pct=36.5)
     t = run_backtest(m1, one(0, 1, 1.0, 0.0, exit_idx=len(idx) - 1), cost, LOOSE).trades.iloc[0]
     # 36.5%/yr = 0.1%/night of $100 = $0.10 per oz per night, 1 oz, 4 nights
     assert t["swap"] == pytest.approx(0.4) and t["pnl"] == pytest.approx(-0.4)
+
+
+def test_rollover_spread_follows_new_york_dst():
+    cost = CostModel(spread_fixed=1.0, spread_bps=0.0, rollover_mult=3.0)
+    winter = pd.DatetimeIndex(["2024-01-10 21:15", "2024-01-10 22:45", "2024-01-10 23:45"], tz="UTC")
+    summer = pd.DatetimeIndex(["2024-07-10 20:15", "2024-07-10 21:45", "2024-07-10 22:45"], tz="UTC")
+    assert list(cost.spread_array(np.full(3, 100.0), winter)) == [1.0, 3.0, 1.0]
+    assert list(cost.spread_array(np.full(3, 100.0), summer)) == [1.0, 3.0, 1.0]
