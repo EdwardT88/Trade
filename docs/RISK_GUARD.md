@@ -42,6 +42,7 @@ Order dari panel dianggap trade manual, jadi tetap dijaga semua aturan di atas.
 
 1. Copy `RiskGuardCent.mq5` ke `MQL5/Experts/`, compile (F7) di MetaEditor.
 2. Pasang di **satu chart aja** (misal XAUUSDc). EA ngejaga semua simbol di akun (`InpGuardAllSymbols = true`).
+   Jalanin cuma di **satu terminal** per akun: kalau udah di VPS, matiin EA ini di MT5 PC (dua guard bakal motong lot / geser SL dobel).
 3. *Allow Algo Trading* harus nyala.
 4. Kalau lu juga jalanin GoldSwingCent: biarin `InpManualOnly = true`. Posisi EA lain nggak diutak-atik satu-satu,
    tapi tetap dihitung di total risk, rugi harian, dan hard stop.
@@ -62,7 +63,7 @@ Order dari panel dianggap trade manual, jadi tetap dijaga semua aturan di atas.
 | `InpDayStartHourServer` | 0 | Jam server buat ganti hari. Exness (GMT+0): 0 = 07:00 WIB. |
 | `InpHardStopPct` / `InpStartBalance` | 30 / 0 | Hard stop. Saldo awal **dalam USC** di akun cent (5000 = $50). |
 | `InpResetHalt` | false | Buat buka HALT: set true sekali, OK, terus balikin false. |
-| `InpFridayCloseAll` | false | Tutup semua posisi Jumat malam (opsional). |
+| `InpFridayCloseAll` / `InpFridayCloseHourSrv` | false / 20 | Tutup semua posisi Jumat jam segini (jam server, opsional). Harus **sebelum** market tutup: Exness (GMT+0) tutup ±21:00 musim panas, 22:00 musim dingin. |
 
 ## Log
 

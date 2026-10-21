@@ -56,7 +56,7 @@ input bool   InpGuardAllSymbols     = true;  // Guard positions on all symbols (
 input bool   InpManualOnly          = true;  // Per-position rules touch only manual positions (magic 0); limits count all
 input bool   InpCloseAllOnLock      = true;  // Close open positions when the daily loss limit locks the account
 input bool   InpFridayCloseAll      = false; // Close all guarded positions on Friday ...
-input int    InpFridayCloseHourSrv  = 22;    // ... at this server hour
+input int    InpFridayCloseHourSrv  = 20;    // ... at this server hour (BEFORE the broker's Friday close; Exness GMT+0 closes ~21:00 in summer)
 
 input group "=== Panel ==="
 input int    InpPanelX              = 10;    // Panel X (pixels)
@@ -87,6 +87,7 @@ struct PosInfo
    double            sl;
    double            tp;
    datetime          time;
+   long              timeMsc;
    double            risk;     // money lost at the stop from the open price; -1 = no stop
   };
 
@@ -96,6 +97,7 @@ struct PosState
    datetime          noSLSince;
    bool              entryChecked;
    datetime          lastAction;
+   int               fails;          // corrective actions that failed in a row
   };
 
 struct DayStats
@@ -112,8 +114,9 @@ int      g_hAtr = INVALID_HANDLE;
 PosState g_state[];
 double   g_riskPct = 1.0;
 bool     g_tpMoved = false;
-datetime g_closeArm = 0;
+uint     g_closeArmMs = 0;   // GetTickCount() when CLOSE ALL was armed (0 = not armed)
 string   g_lastMsg = "";
+double   g_riskBase = 0.0;   // balance at the start of the trading day (set by Guard)
 
 //+------------------------------------------------------------------+
 //| Small helpers                                                    |
@@ -153,10 +156,41 @@ void Log(const string msg)
    FileClose(h);
   }
 
+// start balance + every balance operation booked after it was set, read from the deal history:
+// catches deposits/withdrawals made while the terminal was off and never counts the first funding twice
 double StartBalance()
   {
-   double v = GvGet("start", 0.0);
-   return (v > 0.0) ? v : AccountInfoDouble(ACCOUNT_BALANCE);
+   double base = GvGet("start", 0.0);
+   if(base <= 0.0)
+      return AccountInfoDouble(ACCOUNT_BALANCE);
+   if(!GlobalVariableCheck(g_gv + "start_time"))
+      GvSetFlush("start_time", (double)TimeTradeServer());   // start set by the old version: flows from now on
+   datetime since = (datetime)GvGet("start_time", 0.0);
+   double flow = 0.0;
+   if(HistorySelect(since + 1, TimeTradeServer() + 86400))
+      for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+        {
+         ulong d = HistoryDealGetTicket(i);
+         if(d > 0 && HistoryDealGetInteger(d, DEAL_TYPE) == DEAL_TYPE_BALANCE)
+            flow += HistoryDealGetDouble(d, DEAL_PROFIT);
+        }
+   return base + flow;
+  }
+
+// sets the baseline; balance operations up to now (incl. one already in the balance) are inside `v`
+void SetStart(const double v)
+  {
+   datetime t = TimeTradeServer();
+   if(HistorySelect(0, t + 86400))
+      for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+        {
+         ulong d = HistoryDealGetTicket(i);
+         if(d > 0 && HistoryDealGetInteger(d, DEAL_TYPE) == DEAL_TYPE_BALANCE
+            && (datetime)HistoryDealGetInteger(d, DEAL_TIME) > t)
+            t = (datetime)HistoryDealGetInteger(d, DEAL_TIME);
+        }
+   GvSet("start_time", (double)t);
+   GvSetFlush("start", v);
   }
 
 bool InScope(const string sym) { return InpGuardAllSymbols || sym == _Symbol; }
@@ -238,6 +272,7 @@ int Snapshot(PosInfo &out[])
       p.sl     = PositionGetDouble(POSITION_SL);
       p.tp     = PositionGetDouble(POSITION_TP);
       p.time   = (datetime)PositionGetInteger(POSITION_TIME);
+      p.timeMsc = PositionGetInteger(POSITION_TIME_MSC);
       p.risk   = -1.0;
       int n = ArraySize(out);
       ArrayResize(out, n + 1);
@@ -260,8 +295,9 @@ int StateIndex(const long posId, const bool create)
    ArrayResize(g_state, n + 1);
    g_state[n].posId = posId;
    g_state[n].noSLSince = 0;
-   g_state[n].entryChecked = false;
+   g_state[n].entryChecked = GlobalVariableCheck(g_gv + "ok_" + IntegerToString(posId));   // accepted before a restart
    g_state[n].lastAction = 0;
+   g_state[n].fails = 0;
    return n;
   }
 
@@ -285,14 +321,24 @@ void PruneStates(const PosInfo &pos[])
      }
   }
 
+void NoteResult(const long posId, const bool ok)
+  {
+   int i = StateIndex(posId, true);
+   g_state[i].fails = ok ? 0 : g_state[i].fails + 1;
+  }
+
 bool ClosePos(const PosInfo &p, const string why)
   {
+   if(!PositionSelectByTicket(p.ticket))
+      return false;                                  // already gone (SL/TP/user): CTrade would send nothing
    g_trade.SetTypeFillingBySymbol(p.sym);
    if(g_trade.PositionClose(p.ticket))
      {
+      NoteResult(p.posId, true);
       Log(StringFormat("CLOSED %s %s %.2f lots (#%I64u): %s", p.sym, p.buy ? "BUY" : "SELL", p.vol, p.ticket, why));
       return true;
      }
+   NoteResult(p.posId, false);
    Log(StringFormat("Close #%I64u failed (%s): %u %s", p.ticket, why, g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription()));
    return false;
   }
@@ -309,7 +355,8 @@ void CloseAllGuarded(const string why)
 bool MayAct(const long posId)
   {
    int i = StateIndex(posId, true);
-   if(TimeLocal() - g_state[i].lastAction < 3)
+   int wait = (g_state[i].fails < 5) ? 3 : 60;      // after 5 failures in a row (market closed...) retry once a minute
+   if(TimeLocal() - g_state[i].lastAction < wait)
       return false;
    g_state[i].lastAction = TimeLocal();
    return true;
@@ -318,6 +365,18 @@ bool MayAct(const long posId)
 //+------------------------------------------------------------------+
 //| Today's statistics from the deal history                         |
 //+------------------------------------------------------------------+
+// true while a position with this identifier is still open (so far it was only partly closed)
+bool PositionIdOpen(const long pid)
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+      if(PositionGetTicket(i) > 0 && PositionGetInteger(POSITION_IDENTIFIER) == pid)
+         return true;
+   return false;
+  }
+
+// a position the guard closed as REFUSED is not a trade: no entry, no loss, no cooldown (its money still counts)
+string RefKey(const long pid) { return g_gv + "ref_" + IntegerToString(pid); }
+
 DayStats TodayStats()
   {
    DayStats s;
@@ -325,7 +384,12 @@ DayStats TodayStats()
    s.entries = 0;
    s.consecLosses = 0;
    s.lastLossTime = 0;
-   if(!HistorySelect(DayStartTime(TimeTradeServer()), TimeTradeServer() + 60))
+   datetime nowT  = TimeTradeServer();
+   datetime dayT  = DayStartTime(nowT);
+   datetime fromT = dayT;
+   if(InpCooldownMin > 0 && nowT - InpCooldownMin * 60 < dayT)
+      fromT = nowT - InpCooldownMin * 60;            // a loss just before the day start still starts a cooldown
+   if(!HistorySelect(fromT, nowT + 60))
       return s;
    int total = HistoryDealsTotal();
    for(int i = 0; i < total; i++)
@@ -338,23 +402,51 @@ DayStats TodayStats()
          continue;
       if(!InScope(HistoryDealGetString(d, DEAL_SYMBOL)))
          continue;
+      bool today = ((datetime)HistoryDealGetInteger(d, DEAL_TIME) >= dayT);
       long entry = HistoryDealGetInteger(d, DEAL_ENTRY);
+      long pid   = HistoryDealGetInteger(d, DEAL_POSITION_ID);
+      bool refused = GlobalVariableCheck(RefKey(pid));
       double money = HistoryDealGetDouble(d, DEAL_PROFIT) + HistoryDealGetDouble(d, DEAL_SWAP)
                      + HistoryDealGetDouble(d, DEAL_COMMISSION);
       if(entry == DEAL_ENTRY_IN)
         {
-         s.realized += HistoryDealGetDouble(d, DEAL_COMMISSION);
-         if(Controlled(HistoryDealGetInteger(d, DEAL_MAGIC)))
-            s.entries++;
+         if(today)
+           {
+            s.realized += HistoryDealGetDouble(d, DEAL_COMMISSION);
+            if(!refused && Controlled(HistoryDealGetInteger(d, DEAL_MAGIC)))
+               s.entries++;
+           }
          continue;
         }
-      s.realized += money;
-      if(money < 0.0)
+      if(today)
+         s.realized += money;                       // every closing deal still counts for the daily loss
+      if(refused || PositionIdOpen(pid))
+         continue;                                  // refused by the guard, or only partly closed (e.g. our volume cut)
+      // one result per finished trade, judged at its last closing deal; the trade belongs to whoever opened it
+      bool   last   = true;
+      long   magic  = HistoryDealGetInteger(d, DEAL_MAGIC);
+      double result = 0.0;
+      for(int j = 0; j < total; j++)
         {
-         s.consecLosses++;
+         ulong d2 = HistoryDealGetTicket(j);
+         if(d2 == 0 || HistoryDealGetInteger(d2, DEAL_POSITION_ID) != pid)
+            continue;
+         if(HistoryDealGetInteger(d2, DEAL_ENTRY) == DEAL_ENTRY_IN)
+            magic = HistoryDealGetInteger(d2, DEAL_MAGIC);
+         else if(j > i)
+            last = false;
+         result += HistoryDealGetDouble(d2, DEAL_PROFIT) + HistoryDealGetDouble(d2, DEAL_SWAP)
+                   + HistoryDealGetDouble(d2, DEAL_COMMISSION);
+        }
+      if(!last || !Controlled(magic))
+         continue;                                  // other EAs' trades count only for the daily loss
+      if(result < 0.0)
+        {
+         if(today)
+            s.consecLosses++;
          s.lastLossTime = (datetime)HistoryDealGetInteger(d, DEAL_TIME);
         }
-      else
+      else if(today)
          s.consecLosses = 0;
      }
    return s;
@@ -380,7 +472,11 @@ datetime CooldownUntil(const DayStats &ds)
 //+------------------------------------------------------------------+
 //| Corrective actions on one position                               |
 //+------------------------------------------------------------------+
-double MaxRiskMoney() { return AccountInfoDouble(ACCOUNT_EQUITY) * InpMaxRiskPerTradePct / 100.0; }
+// risk caps use the balance at the start of the trading day: floating P/L or the spread of a fill must not
+// turn a correctly sized position into an "oversized" one or a refused one
+double RiskBase()         { return (g_riskBase > 0.0) ? g_riskBase : AccountInfoDouble(ACCOUNT_BALANCE); }
+double MaxRiskMoney()     { return RiskBase() * InpMaxRiskPerTradePct / 100.0; }
+double MaxOpenRiskMoney() { return RiskBase() * InpMaxOpenRiskPct / 100.0; }
 
 // stop price at which `p` loses exactly `money`; 0 if it cannot be computed
 double StopForMoney(const PosInfo &p, const double money)
@@ -419,10 +515,18 @@ void SetEmergencyStop(const PosInfo &p)
      }
    g_trade.SetTypeFillingBySymbol(p.sym);
    if(g_trade.PositionModify(p.ticket, sl, p.tp))
+     {
+      NoteResult(p.posId, true);
       Log(StringFormat("Emergency STOP set on %s #%I64u at %s (risk %.1f%%)", p.sym, p.ticket,
                        DoubleToString(sl, (int)SymbolInfoInteger(p.sym, SYMBOL_DIGITS)), InpMaxRiskPerTradePct));
+     }
    else
+     {
       Log(StringFormat("Emergency stop on #%I64u failed: %u %s", p.ticket, g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription()));
+      NoteResult(p.posId, false);
+      if(g_state[StateIndex(p.posId, true)].fails >= 3)
+         ClosePos(p, "no stop loss and the emergency stop was rejected 3 times");
+     }
   }
 
 // position risks more than allowed: reduce volume, else tighten the stop, else close
@@ -433,7 +537,8 @@ void CutRisk(const PosInfo &p)
    double vstep = SymbolInfoDouble(p.sym, SYMBOL_VOLUME_STEP);
    if(vstep <= 0.0)
       vstep = vmin;
-   if(p.risk > 0.0 && vstep > 0.0 && p.vol > 0.0)
+   bool hedging = ((ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING);
+   if(hedging && p.risk > 0.0 && vstep > 0.0 && p.vol > 0.0)   // CTrade::PositionClosePartial(ticket) is hedging-only
      {
       double perLot = p.risk / p.vol;
       double keep = MathFloor(allowed / perLot / vstep + 1e-9) * vstep;
@@ -464,18 +569,50 @@ void CutRisk(const PosInfo &p)
    ClosePos(p, StringFormat("risk %.2f %s above the max %.2f and could not be reduced", p.risk, Ccy(), allowed));
   }
 
+// while halted / locked a pending order would only fill and be closed again at minus the spread
+void DeleteGuardedPendings(const string why)
+  {
+   static datetime last = 0;
+   if(TimeLocal() - last < 30)
+      return;
+   last = TimeLocal();
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      ulong t = OrderGetTicket(i);
+      if(t == 0 || !InScope(OrderGetString(ORDER_SYMBOL)) || !Controlled(OrderGetInteger(ORDER_MAGIC)))
+         continue;
+      ENUM_ORDER_TYPE ot = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      if(ot == ORDER_TYPE_BUY || ot == ORDER_TYPE_SELL || ot == ORDER_TYPE_CLOSE_BY)
+         continue;
+      if(g_trade.OrderDelete(t))
+         Log(StringFormat("Pending order #%I64u deleted: %s", t, why));
+     }
+  }
+
 //+------------------------------------------------------------------+
 //| The guard: runs every second and after every trade event         |
 //+------------------------------------------------------------------+
+// right after a terminal start OnInit/OnTimer can run before the account is logged in and synchronised
+bool AccountReady()
+  {
+   if(!(bool)MQLInfoInteger(MQL_TESTER) && !(bool)TerminalInfoInteger(TERMINAL_CONNECTED))
+      return false;
+   return AccountInfoInteger(ACCOUNT_LOGIN) > 0 && AccountInfoDouble(ACCOUNT_BALANCE) > 0.0
+          && AccountInfoDouble(ACCOUNT_EQUITY) > 0.0;
+  }
+
 void Guard()
   {
+   if(!AccountReady())
+      return;                          // equity 0 before the sync must never be read as a loss
    PosInfo pos[];
    Snapshot(pos);
    PruneStates(pos);
    DayStats ds = TodayStats();
-   double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
+   double equity  = AccountInfoDouble(ACCOUNT_EQUITY) - AccountInfoDouble(ACCOUNT_CREDIT);   // own money only
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    datetime now   = TimeTradeServer();
+   g_riskBase = balance - ds.realized;
 
    // 1) hard stop
    if(!IsHalted() && GvGet("start", 0.0) > 0.0 && equity <= StartBalance() * (1.0 - InpHardStopPct / 100.0))
@@ -488,6 +625,7 @@ void Guard()
      }
    if(IsHalted())
      {
+      DeleteGuardedPendings("account HALTED");
       for(int k = 0; k < ArraySize(pos); k++)
          if(MayAct(pos[k].posId))
             ClosePos(pos[k], "account HALTED (hard stop)");
@@ -496,19 +634,27 @@ void Guard()
 
    // 2) daily loss limit and loss streak
    double dayStart = balance - ds.realized;
-   if(dayStart > 0.0 && ds.realized + FloatingPnL(pos) <= -InpDailyLossPct / 100.0 * dayStart)
+   double dayPnl   = ds.realized + FloatingPnL(pos);
+   long   todayKey = DayKey(now);
+   if(dayStart > 0.0 && dayPnl <= -InpDailyLossPct / 100.0 * dayStart && (long)GvGet("dl_day", -1.0) != todayKey)
      {
-      if(!IsDayLocked())
-        {
-         LockDay(1, StringFormat("daily loss %.2f %s reached the %.1f%% limit", ds.realized + FloatingPnL(pos), Ccy(), InpDailyLossPct));
-         if(InpCloseAllOnLock)
-            for(int k = 0; k < ArraySize(pos); k++)
-               ClosePos(pos[k], "daily loss limit");
-         return;
-        }
+      GvSet("dl_time", (double)now);
+      GvSetFlush("dl_day", (double)todayKey);        // own flag: an earlier loss-streak lock must not suppress this
+      if(IsDayLocked())
+         Log(StringFormat("daily loss %.2f %s reached the %.1f%% limit (day already locked)", dayPnl, Ccy(), InpDailyLossPct));
+      LockDay(1, StringFormat("daily loss %.2f %s reached the %.1f%% limit", dayPnl, Ccy(), InpDailyLossPct));
+     }
+   if(InpCloseAllOnLock && (long)GvGet("dl_day", -1.0) == todayKey)
+     {
+      datetime dlTime = (datetime)GvGet("dl_time", 0.0);
+      for(int k = 0; k < ArraySize(pos); k++)
+         if(pos[k].time <= dlTime && MayAct(pos[k].posId))   // retried until flat, also after a restart
+            ClosePos(pos[k], "daily loss limit");
      }
    if(ds.consecLosses >= InpMaxConsecLosses)
       LockDay(2, StringFormat("%d losses in a row", ds.consecLosses));
+   if(IsDayLocked())
+      DeleteGuardedPendings("trading locked for today");
 
    // 3) Friday close
    if(InpFridayCloseAll)
@@ -523,7 +669,7 @@ void Guard()
 
    datetime lockedSince = LockedSince();
    datetime cooldown = CooldownUntil(ds);
-   double maxOpen = equity * InpMaxOpenRiskPct / 100.0;
+   double maxOpen = MaxOpenRiskMoney();
 
    // 4) rules for newly opened positions (oldest first, so the newest ones are the ones refused)
    int order[];
@@ -532,7 +678,8 @@ void Guard()
       order[k] = k;
    for(int a = 0; a < ArraySize(order); a++)
       for(int b = a + 1; b < ArraySize(order); b++)
-         if(pos[order[b]].time < pos[order[a]].time)
+         if(pos[order[b]].timeMsc < pos[order[a]].timeMsc
+            || (pos[order[b]].timeMsc == pos[order[a]].timeMsc && pos[order[b]].posId < pos[order[a]].posId))
            {
             int tmp = order[a];
             order[a] = order[b];
@@ -574,12 +721,13 @@ void Guard()
          refuse = StringFormat("max %d trades per day", InpMaxTradesPerDay);
       else if(kept + 1 > InpMaxPositions)
          refuse = StringFormat("max %d open positions", InpMaxPositions);
-      else if(keptRisk + MathMin(r, MaxRiskMoney()) > maxOpen + 1e-9)
+      else if(keptRisk + MathMin(r, MaxRiskMoney()) > maxOpen * 1.02)   // same slack as the per-position rule (slippage)
          refuse = StringFormat("total open risk would exceed %.1f%%", InpMaxOpenRiskPct);
       if(refuse != "")
         {
          if(MayAct(p.posId) && ClosePos(p, "REFUSED: " + refuse))
            {
+            GvSetFlush("ref_" + IntegerToString(p.posId), (double)now);   // not a trade: see TodayStats()
             if(today)
                entriesSoFar--;
             continue;
@@ -589,6 +737,7 @@ void Guard()
          continue;
         }
       g_state[si].entryChecked = true;
+      GvSetFlush("ok_" + IntegerToString(p.posId), 1.0);   // never re-judged after a restart / recompile
       kept++;
       keptRisk += MathMin(r, MaxRiskMoney());
      }
@@ -604,7 +753,9 @@ void Guard()
         {
          if(g_state[si].noSLSince == 0)
             g_state[si].noSLSince = TimeLocal();
-         if(TimeLocal() - g_state[si].noSLSince >= InpNoSLGraceSec && MayAct(p.posId))
+         double esl = StopForMoney(p, MaxRiskMoney());
+         bool hopeless = (esl > 0.0 && !StopPlaceable(p, esl));   // even a max-risk stop is already behind the price
+         if((hopeless || TimeLocal() - g_state[si].noSLSince >= InpNoSLGraceSec) && MayAct(p.posId))
             SetEmergencyStop(p);
          continue;
         }
@@ -643,7 +794,7 @@ double PanelLots(const bool buy, const double sl, string &why, double &riskMoney
       why = "cannot price the risk";
       return 0.0;
      }
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double equity = MathMin(AccountInfoDouble(ACCOUNT_EQUITY), RiskBase());   // never size above the guard's cap
    double pct = MathMin(g_riskPct, InpMaxRiskPerTradePct);
    double vmin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double vmax  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
@@ -698,8 +849,7 @@ string PanelBlock()
    double open = 0.0;
    for(int k = 0; k < n; k++)
       open += (pos[k].risk >= 0.0) ? pos[k].risk : MaxRiskMoney();
-   if(open + AccountInfoDouble(ACCOUNT_EQUITY) * MathMin(g_riskPct, InpMaxRiskPerTradePct) / 100.0
-      > AccountInfoDouble(ACCOUNT_EQUITY) * InpMaxOpenRiskPct / 100.0 + 1e-9)
+   if(open + RiskBase() * MathMin(g_riskPct, InpMaxRiskPerTradePct) / 100.0 > MaxOpenRiskMoney() + 1e-9)
       return StringFormat("total open risk would exceed %.1f%%", InpMaxOpenRiskPct);
    return "";
   }
@@ -744,6 +894,7 @@ void CreateSLLine()
    double sl = NormalizeDouble(SymbolInfoDouble(_Symbol, SYMBOL_BID) - dist, _Digits);
    ObjectDelete(0, SL_LINE);
    ObjectCreate(0, SL_LINE, OBJ_HLINE, 0, 0, sl);
+   ObjectSetString(0, SL_LINE, OBJPROP_TEXT, _Symbol);   // lets OnInit drop a line left over from another symbol
    ObjectSetInteger(0, SL_LINE, OBJPROP_COLOR, clrRed);
    ObjectSetInteger(0, SL_LINE, OBJPROP_WIDTH, 2);
    ObjectSetInteger(0, SL_LINE, OBJPROP_SELECTABLE, true);
@@ -754,8 +905,23 @@ void CreateSLLine()
    ChartRedraw();
   }
 
+void ApplyRiskEdit()
+  {
+   if(ObjectFind(0, EDT_RISK) < 0)
+      return;
+   string txt = ObjectGetString(0, EDT_RISK, OBJPROP_TEXT);
+   StringReplace(txt, ",", ".");        // "0,5" (decimal comma) must not be read as 0
+   StringTrimLeft(txt);
+   StringTrimRight(txt);
+   double v = StringToDouble(txt);
+   if(v > 0.0)
+      g_riskPct = MathMin(v, InpMaxRiskPerTradePct);
+   ObjectSetString(0, EDT_RISK, OBJPROP_TEXT, DoubleToString(g_riskPct, 2));
+  }
+
 void PanelTrade(const bool buy)
   {
+   ApplyRiskEdit();
    string block = PanelBlock();
    if(block != "")
      {
@@ -771,11 +937,27 @@ void PanelTrade(const bool buy)
       Log("Panel order refused: " + why);
       return;
      }
+   // the min-lot raise can make the real risk bigger than PanelBlock's estimate: check it the way Guard() will
+   PosInfo cur[];
+   int nCur = Snapshot(cur);
+   double openRisk = 0.0;
+   for(int k = 0; k < nCur; k++)
+      openRisk += (cur[k].risk >= 0.0) ? cur[k].risk : MaxRiskMoney();
+   if(openRisk + MathMin(riskMoney, MaxRiskMoney()) > MaxOpenRiskMoney() + 1e-9)
+     {
+      Log(StringFormat("Panel order refused: open risk %.2f + this trade %.2f would exceed %.1f%%", openRisk, riskMoney, InpMaxOpenRiskPct));
+      return;
+     }
+   if(!g_tpMoved && ObjectFind(0, TP_LINE) >= 0)
+      PlaceTPLine();                      // TP = InpDefaultRR x the SL distance from the CURRENT entry price
    double tp = LinePrice(TP_LINE);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    if(tp > 0.0 && ((buy && tp <= ask) || (!buy && tp >= bid)))
+     {
+      Log("TP line is behind the price: order sent WITHOUT take profit");
       tp = 0.0;
+     }
    sl = NormalizeDouble(sl, _Digits);
    tp = (tp > 0.0) ? NormalizeDouble(tp, _Digits) : 0.0;
    g_trade.SetTypeFillingBySymbol(_Symbol);
@@ -811,6 +993,7 @@ void MakeButton(const string name, const string text, const int x, const int y, 
    ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 9);
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, name, OBJPROP_STATE, false);
+   ObjectSetInteger(0, name, OBJPROP_ZORDER, 100);     // a click goes to the button, not to an SL line under it
    ObjectSetString(0, name, OBJPROP_TEXT, text);
   }
 
@@ -835,10 +1018,15 @@ void SetLine(const int i, const string text, const color c)
    ObjectSetInteger(0, name, OBJPROP_COLOR, c);
   }
 
+bool g_oneClick = false;
+
 void BuildPanel()
   {
    int x = InpPanelX;
    int y = InpPanelY;
+   g_oneClick = (bool)ChartGetInteger(0, CHART_SHOW_ONE_CLICK);
+   if(g_oneClick && y < 90)
+      y = 90;                           // keep clear of MT5's One Click Trading panel (top-left corner)
    MakeButton(BTN_SL, "SL LINE", x, y, 70, clrDimGray);
    MakeButton(BTN_BUY, "BUY", x + 75, y, 60, clrSeaGreen);
    MakeButton(BTN_SELL, "SELL", x + 140, y, 60, clrFireBrick);
@@ -851,7 +1039,8 @@ void BuildPanel()
    ObjectSetInteger(0, EDT_RISK, OBJPROP_XSIZE, 50);
    ObjectSetInteger(0, EDT_RISK, OBJPROP_YSIZE, 22);
    ObjectSetInteger(0, EDT_RISK, OBJPROP_ALIGN, ALIGN_CENTER);
-   ObjectSetString(0, EDT_RISK, OBJPROP_TEXT, DoubleToString(g_riskPct, 1));
+   ObjectSetInteger(0, EDT_RISK, OBJPROP_ZORDER, 100);
+   ObjectSetString(0, EDT_RISK, OBJPROP_TEXT, DoubleToString(g_riskPct, 2));
    ObjectSetString(0, EDT_RISK, OBJPROP_TOOLTIP, "Risk per trade % (max " + DoubleToString(InpMaxRiskPerTradePct, 1) + ")");
    for(int i = 0; i < N_LINES; i++)
       MakeLabel(LBL + IntegerToString(i), x, y + 28 + i * 15);
@@ -861,6 +1050,9 @@ void UpdatePanel()
   {
    if((bool)MQLInfoInteger(MQL_TESTER) && !(bool)MQLInfoInteger(MQL_VISUAL_MODE))
       return;
+   if(ObjectFind(0, BTN_BUY) < 0 || ObjectFind(0, BTN_SELL) < 0 || ObjectFind(0, BTN_CLOSE) < 0
+      || ObjectFind(0, EDT_RISK) < 0 || ObjectFind(0, LBL + IntegerToString(N_LINES - 1)) < 0)
+      BuildPanel();                     // deleted by the user or by another program's ObjectsDeleteAll
    PosInfo pos[];
    int n = Snapshot(pos);
    DayStats ds = TodayStats();
@@ -879,7 +1071,26 @@ void UpdatePanel()
    string status;
    string reason = "";
    color sc = clrLimeGreen;
-   if(IsHalted())
+   bool live = !(bool)MQLInfoInteger(MQL_TESTER);
+   bool canTrade = (bool)TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && (bool)MQLInfoInteger(MQL_TRADE_ALLOWED)
+                   && (bool)AccountInfoInteger(ACCOUNT_TRADE_EXPERT);
+   static bool s_warned = false;
+   if(live && !canTrade && !s_warned)
+      Alert("RiskGuard: Algo Trading is OFF - stops and closes cannot be enforced.");
+   s_warned = live && !canTrade;
+   if(live && !(bool)TerminalInfoInteger(TERMINAL_CONNECTED))
+     {
+      status = "NO CONNECTION - guard cannot act";
+      reason = "Positions are NOT protected until reconnected";
+      sc = clrRed;
+     }
+   else if(live && !canTrade)
+     {
+      status = "GUARD OFF - Algo Trading disabled";
+      reason = "Turn Algo Trading on: nothing is enforced";
+      sc = clrRed;
+     }
+   else if(IsHalted())
      {
       status = "HALTED (hard stop)";
       reason = "Review first, then set InpResetHalt=true";
@@ -962,15 +1173,16 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
          PanelTrade(false);
       else if(sparam == BTN_CLOSE)
         {
-         if(g_closeArm > 0 && TimeLocal() - g_closeArm <= 5)
+         uint age = GetTickCount() - g_closeArmMs;
+         if(g_closeArmMs > 0 && age >= 700 && age <= 5000)   // a double click is not a confirmation
            {
-            g_closeArm = 0;
+            g_closeArmMs = 0;
             CloseAllGuarded("CLOSE ALL button");
             ObjectSetString(0, BTN_CLOSE, OBJPROP_TEXT, "CLOSE ALL");
            }
-         else
+         else if(g_closeArmMs == 0 || age > 5000)
            {
-            g_closeArm = TimeLocal();
+            g_closeArmMs = GetTickCount();
             ObjectSetString(0, BTN_CLOSE, OBJPROP_TEXT, "CONFIRM?");
            }
         }
@@ -978,20 +1190,25 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
          ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
       UpdatePanel();
      }
-   else if(id == CHARTEVENT_OBJECT_DRAG)
+   else if(id == CHARTEVENT_OBJECT_DRAG || id == CHARTEVENT_OBJECT_CHANGE)   // CHANGE = edited in the Properties dialog
      {
-      if(sparam == SL_LINE && !g_tpMoved)
-         PlaceTPLine();
+      if(sparam == SL_LINE)
+        {
+         double tpNow = LinePrice(TP_LINE);
+         bool buySide = LinePrice(SL_LINE) < SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         if(g_tpMoved && tpNow > 0.0
+            && (buySide ? tpNow <= SymbolInfoDouble(_Symbol, SYMBOL_ASK) : tpNow >= SymbolInfoDouble(_Symbol, SYMBOL_BID)))
+            g_tpMoved = false;            // SL moved to the other side: the hand-placed TP no longer fits
+         if(!g_tpMoved)
+            PlaceTPLine();
+        }
       else if(sparam == TP_LINE)
          g_tpMoved = true;
       UpdatePanel();
      }
    else if(id == CHARTEVENT_OBJECT_ENDEDIT && sparam == EDT_RISK)
      {
-      double v = StringToDouble(ObjectGetString(0, EDT_RISK, OBJPROP_TEXT));
-      if(v > 0.0)
-         g_riskPct = MathMin(v, InpMaxRiskPerTradePct);
-      ObjectSetString(0, EDT_RISK, OBJPROP_TEXT, DoubleToString(g_riskPct, 1));
+      ApplyRiskEdit();
       UpdatePanel();
      }
   }
@@ -1002,8 +1219,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
       return;
    if(HistoryDealSelect(trans.deal) && HistoryDealGetInteger(trans.deal, DEAL_TYPE) == DEAL_TYPE_BALANCE)
      {
-      double flow = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
-      GvSetFlush("start", StartBalance() + flow);
+      double flow = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);   // StartBalance() adds it from the deal history
       Log(StringFormat("Balance operation %+.2f: hard-stop start balance is now %.2f", flow, StartBalance()));
       return;
      }
@@ -1012,14 +1228,22 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
 
 void OnTimer()
   {
-   if(GvGet("start", 0.0) <= 0.0 && AccountInfoDouble(ACCOUNT_BALANCE) > 0.0)
-      GvSetFlush("start", AccountInfoDouble(ACCOUNT_BALANCE));
-   Guard();
-   if(g_closeArm > 0 && TimeLocal() - g_closeArm > 5)
+   long login = AccountInfoInteger(ACCOUNT_LOGIN);
+   if(login > 0 && g_gv != StringFormat("RG_%I64d_", login))
      {
-      g_closeArm = 0;
+      g_gv = StringFormat("RG_%I64d_", login);      // OnInit ran before the login was known
+      Log("account synchronised, saved state read from " + g_gv);
+     }
+   if(GvGet("start", 0.0) <= 0.0 && AccountInfoDouble(ACCOUNT_BALANCE) > 0.0)
+      SetStart(AccountInfoDouble(ACCOUNT_BALANCE));
+   Guard();
+   if(g_closeArmMs > 0 && GetTickCount() - g_closeArmMs > 5000)
+     {
+      g_closeArmMs = 0;
       ObjectSetString(0, BTN_CLOSE, OBJPROP_TEXT, "CLOSE ALL");
      }
+   if((bool)ChartGetInteger(0, CHART_SHOW_ONE_CLICK) != g_oneClick)
+      BuildPanel();
    UpdatePanel();
   }
 
@@ -1034,10 +1258,12 @@ void OnTick()
 bool AnotherInstance()
   {
    for(long id = ChartFirst(); id >= 0; id = ChartNext(id))
-      if(id != ChartID() && ChartGetString(id, CHART_EXPERT_NAME) == MQLInfoString(MQL_PROGRAM_NAME))
+      if(id != ChartID() && StringFind(ChartGetString(id, CHART_EXPERT_NAME), "RiskGuard") == 0)
          return true;
    return false;
   }
+
+bool g_keepPanel = false;   // true across a symbol/timeframe change (an EA keeps its globals then)
 
 int OnInit()
   {
@@ -1046,13 +1272,22 @@ int OnInit()
       Alert("RiskGuard already runs on another chart. Use only one instance per account.");
       return INIT_FAILED;
      }
+   if(AccountInfoInteger(ACCOUNT_LOGIN) > 0
+      && (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE) != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
+      Alert("RiskGuard: NETTING account. Adding to or reversing a position is not re-checked against the lock, "
+            + "cooldown and limits. Use a hedging account.");
    if(InpRiskPct <= 0.0 || InpMaxRiskPerTradePct <= 0.0 || InpMaxRiskPerTradePct > 10.0 || InpMaxOpenRiskPct < InpMaxRiskPerTradePct
-      || InpHardStopPct <= 0.0 || InpHardStopPct >= 100.0 || InpMaxPositions < 1 || InpDayStartHourServer < 0 || InpDayStartHourServer > 23)
+      || InpHardStopPct <= 0.0 || InpHardStopPct >= 100.0 || InpMaxPositions < 1 || InpDayStartHourServer < 0 || InpDayStartHourServer > 23
+      || InpDailyLossPct <= 0.0 || InpMaxTradesPerDay < 1 || InpMaxConsecLosses < 1 || InpNoSLGraceSec < 0
+      || InpFridayCloseHourSrv < 0 || InpFridayCloseHourSrv > 23)
      {
-      Print("RiskGuard: inputs out of range (0 < risk; max risk per trade <= 10%; max open risk >= max per trade; 0 < hard stop < 100%; positions >= 1).");
+      Alert("RiskGuard NOT running: inputs out of range (0 < risk; max risk per trade <= 10%; max open risk >= max per trade; "
+            + "0 < hard stop < 100%; positions, trades per day, losses in a row >= 1; daily loss > 0; hours 0-23).");
       return INIT_PARAMETERS_INCORRECT;
      }
    g_gv = StringFormat("RG_%I64d_", AccountInfoInteger(ACCOUNT_LOGIN));
+   if((bool)MQLInfoInteger(MQL_TESTER))
+      GlobalVariablesDeleteAll(g_gv);   // fresh state for every tester pass (as GoldSwingCent does)
    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
    bool newStartInput = (InpStartBalance > 0.0 && MathAbs(GvGet("start_input", 0.0) - InpStartBalance) > 0.001);
    if(newStartInput && bal > 0.0 && (InpStartBalance < 0.2 * bal || InpStartBalance > 5.0 * bal))
@@ -1063,15 +1298,15 @@ int OnInit()
      }
    if(newStartInput)
      {
-      GvSetFlush("start", InpStartBalance);
+      SetStart(InpStartBalance);
       GvSetFlush("start_input", InpStartBalance);
      }
    else if(GvGet("start", 0.0) <= 0.0 && bal > 0.0)
-      GvSetFlush("start", bal);
+      SetStart(bal);
    if(InpResetHalt && GvGet("reset_armed", 1.0) > 0.5 && bal > 0.0)
      {
       if(!newStartInput)
-         GvSetFlush("start", bal);
+         SetStart(bal);
       GvSetFlush("halted", 0.0);
       GvSetFlush("reset_armed", 0.0);
       Log(StringFormat("Halt cleared. New hard-stop start balance %.2f.", StartBalance()));
@@ -1079,13 +1314,27 @@ int OnInit()
    else if(!InpResetHalt)
       GvSet("reset_armed", 1.0);
 
-   g_riskPct = MathMin(InpRiskPct, InpMaxRiskPerTradePct);
+   if(!g_keepPanel || g_riskPct <= 0.0)
+      g_riskPct = InpRiskPct;           // keep what was typed in the box across a symbol/timeframe change
+   g_riskPct = MathMin(g_riskPct, InpMaxRiskPerTradePct);
+   g_keepPanel = false;
    g_trade.SetExpertMagicNumber(0);        // panel orders count as manual trades
    g_trade.SetDeviationInPoints(50);
    g_trade.SetAsyncMode(false);
+   if(ObjectFind(0, SL_LINE) >= 0 && ObjectGetString(0, SL_LINE, OBJPROP_TEXT) != _Symbol)
+     {
+      ObjectDelete(0, SL_LINE);         // drawn for another symbol: its price means nothing here
+      ObjectDelete(0, TP_LINE);
+      g_tpMoved = false;
+     }
+   g_closeArmMs = 0;                   // globals survive a timeframe change: never stay armed behind a fresh label
    g_hAtr = iATR(_Symbol, _Period, 14);
    BuildPanel();
-   EventSetTimer(1);
+   if(!EventSetTimer(1))
+     {
+      Alert("RiskGuard: EventSetTimer failed (" + IntegerToString(GetLastError()) + "), the guard cannot run.");
+      return INIT_FAILED;
+     }
    Log(StringFormat("started. Risk %.1f%% (max %.1f%% per trade, %.1f%% open), daily loss %.1f%%, hard stop at %.2f %s",
                     g_riskPct, InpMaxRiskPerTradePct, InpMaxOpenRiskPct, InpDailyLossPct,
                     StartBalance() * (1.0 - InpHardStopPct / 100.0), Ccy()));
@@ -1096,13 +1345,14 @@ int OnInit()
 
 void OnDeinit(const int reason)
   {
+   g_keepPanel = (reason == REASON_CHARTCHANGE);
    EventKillTimer();
    if(g_hAtr != INVALID_HANDLE)
       IndicatorRelease(g_hAtr);
    ObjectsDeleteAll(0, PFX + "BTN_");
    ObjectsDeleteAll(0, PFX + "EDT_");
    ObjectsDeleteAll(0, LBL);
-   if(reason == REASON_REMOVE)
+   if(reason == REASON_REMOVE || reason == REASON_INITFAILED)
      {
       ObjectDelete(0, SL_LINE);
       ObjectDelete(0, TP_LINE);
