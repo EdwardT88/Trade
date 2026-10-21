@@ -16,5 +16,7 @@ intraday H1 momentum/reversal basket, calendar/time-of-day flows (Tokyo fix/goto
 3. Validation avg R > 0 under stress costs.
 4. Median holding time ≤ 24 h.
 5. Final holdout 2026 (pairs available in the sample): pooled avg R > 0 after base costs.
+   Holdout window: trades entered 2026-05-01 – 2026-09-25 (Mar 26 – Apr 30 only warms indicators up),
+   run with `scripts/holdout_2026.py` (FX on M15, gold/silver on M1).
 
 If no style passes, the answer is reported as "no robust short-duration edge found".
