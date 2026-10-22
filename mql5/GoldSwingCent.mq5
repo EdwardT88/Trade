@@ -714,7 +714,9 @@ bool OpenTrade(const bool isBuy, const double slDist, const double trailDist, co
       // initial stop distance, money at risk and kind, for R (Kelly), the weekend hold and the re-entry rule
       GvSet(StringFormat("s0_%I64d", (long)openOrder), slDist);
       GvSet(StringFormat("tg_%I64d", (long)openOrder), reentry ? 1.0 : 0.0);
-      GvSetFlush(StringFormat("r0_%I64d", (long)openOrder), lots * LossPerLot(isBuy, slDist));
+      GvSet(StringFormat("ot_%I64d", (long)openOrder), (double)TimeCurrent());
+      double filled = (g_trade.ResultVolume() > 0.0) ? g_trade.ResultVolume() : lots;
+      GvSetFlush(StringFormat("r0_%I64d", (long)openOrder), filled * LossPerLot(isBuy, slDist + InpRiskBufferUSD));
      }
    GvSet("re_dir", 0.0);   // one re-entry per stop-out; a new trade replaces the last stop-out
    GvSetFlush("re_until", 0.0);
@@ -937,7 +939,20 @@ void ManagePosition()
      }
    else if(InpFridayClose && ((u.day_of_week == 5 && u.hour >= InpFridayCloseHourUTC) || u.day_of_week == 6 || u.day_of_week == 0))
      {
-      if(InpWeekendHold && u.day_of_week == 5 && sl0 > 0.0 && (isBuy || !InpWkLongOnly) && openR >= InpWkMinR)
+      bool hold = InpWeekendHold && u.day_of_week == 5 && sl0 > 0.0 && (isBuy || !InpWkLongOnly) && openR >= InpWkMinR;
+      if(hold)
+        {
+         // the lock must be in place before the weekend: if the broker refuses it, close as usual
+         double lock = NormPrice(isBuy ? entry + InpWkLockR * sl0 : entry - InpWkLockR * sl0);
+         bool tighter = isBuy ? (lock > curSL) : (curSL <= 0.0 || lock < curSL);
+         if(tighter && !g_trade.PositionModify(ticket, lock, PositionGetDouble(POSITION_TP)))
+           {
+            PrintFormat("Weekend hold: stop lock at %.2f refused (%u %s)", lock, g_trade.ResultRetcode(),
+                        g_trade.ResultRetcodeDescription());
+            hold = false;
+           }
+        }
+      if(hold)
         {
          wkEnd = (double)(DayStart(nowU) + InpFridayCloseHourUTC * 3600 + InpWkHours * 3600);
          GvSetFlush(wkKey, wkEnd);
@@ -955,18 +970,28 @@ void ManagePosition()
       CloseAllThrottled("holiday early close");
       return;
      }
-   bool extended = GvGet(exKey, 0.0) > 0.5;
+   double exEnd = GvGet(exKey, 0.0);   // > 0: extended until this UTC time (Friday close); < 0: declined
+   bool extended = exEnd > 0.0;
+   if(wkEnd <= 0.0 && extended && (double)nowU >= exEnd)
+     {
+      CloseAllThrottled("extension ended");   // the Friday close was missed (EA off, no ticks)
+      return;
+     }
    if(wkEnd <= 0.0 && !extended && InpMaxHoldDays > 0 && TimeCurrent() - opened >= InpMaxHoldDays * 86400)
      {
-      if(InpCapExtend && sl0 > 0.0 && openR >= InpExtMinR && H4Trend() == (isBuy ? 1 : -1))
+      // decided once at the cap, like the research; a failed close then retries instead of re-deciding
+      if(exEnd == 0.0 && InpCapExtend && sl0 > 0.0 && openR >= InpExtMinR && H4Trend() == (isBuy ? 1 : -1))
         {
-         GvSetFlush(exKey, 1.0);
+         exEnd = (double)(DayStart(nowU) + ((5 - u.day_of_week + 7) % 7) * 86400 + InpFridayCloseHourUTC * 3600);
+         GvSetFlush(exKey, exEnd);
          extended = true;
          PrintFormat("Max hold reached with %.2fR in a live trend: kept until the Friday close, stop locked at +%.2fR",
                      openR, InpExtLockR);
         }
       else
         {
+         if(exEnd == 0.0)
+            GvSet(exKey, -1.0);
          CloseAllThrottled("max hold time");
          return;
         }
@@ -1016,6 +1041,7 @@ void ManagePosition()
          return;
       if(newSL >= bid)
         {
+         GvSet(StringFormat("xs_%I64d", posId), 1.0);   // a stop exit for the re-entry rule
          CloseAll("stop level crossed");
          return;
         }
@@ -1028,6 +1054,7 @@ void ManagePosition()
          return;
       if(newSL <= ask)
         {
+         GvSet(StringFormat("xs_%I64d", posId), 1.0);
          CloseAll("stop level crossed");
          return;
         }
@@ -1132,13 +1159,14 @@ void ProcessClosedPositions()
    for(int k = 0; k < ArraySize(ids); k++)
      {
       long id = ids[k];
-      if(id <= 0 || PositionIsOpen(id) || !HistorySelectByPosition(id))
+      if(id <= 0 || PositionIsOpen(id))
          continue;
-      double net = 0.0, inVol = 0.0, outVol = 0.0;
+      double net = 0.0, inVol = 0.0, outVol = 0.0, inPx = 0.0, outPx = 0.0;
       long reason = -1;
       datetime exitT = 0;
       bool isBuy = true;
-      for(int i = 0; i < HistoryDealsTotal(); i++)
+      int deals = HistorySelectByPosition(id) ? HistoryDealsTotal() : 0;
+      for(int i = 0; i < deals; i++)
         {
          ulong d = HistoryDealGetTicket(i);
          if(d == 0)
@@ -1149,6 +1177,7 @@ void ProcessClosedPositions()
          if(e == DEAL_ENTRY_IN)
            {
             inVol += HistoryDealGetDouble(d, DEAL_VOLUME);
+            inPx = HistoryDealGetDouble(d, DEAL_PRICE);
             isBuy = (HistoryDealGetInteger(d, DEAL_TYPE) == DEAL_TYPE_BUY);
            }
          else if(e == DEAL_ENTRY_OUT || e == DEAL_ENTRY_OUT_BY)
@@ -1159,13 +1188,17 @@ void ProcessClosedPositions()
               {
                exitT = t;
                reason = HistoryDealGetInteger(d, DEAL_REASON);
+               outPx = HistoryDealGetDouble(d, DEAL_PRICE);
               }
            }
         }
-      if(inVol <= 0.0 || outVol < inVol - 1e-8)
+      bool never = (inVol <= 0.0 && TimeCurrent() - (datetime)GvGet(StringFormat("ot_%I64d", id), 0.0) > 86400);
+      if(!never && (inVol <= 0.0 || outVol < inVol - 1e-8))
          continue;   // history not complete yet: retry later
       double risk0 = GvGet(StringFormat("r0_%I64d", id), 0.0);
-      if(risk0 > 0.0)
+      GvDel(StringFormat("r0_%I64d", id));   // removed before the push: a crash must not book the trade twice
+      GlobalVariablesFlush();
+      if(risk0 > 0.0 && !never)
         {
          double r = net / risk0;
          RHistPush(r);
@@ -1176,7 +1209,10 @@ void ProcessClosedPositions()
                      RHistCount(), nextBase);
         }
       bool normal = GvGet(StringFormat("tg_%I64d", id), 0.0) < 0.5;
-      if(InpReentry && normal && reason == DEAL_REASON_SL && net < 0.0 && !SelectMyPosition())
+      // research: a stop hit at a level below the entry (not a breakeven stop, not a time exit)
+      bool stopExit = (reason == DEAL_REASON_SL || GvGet(StringFormat("xs_%I64d", id), 0.0) > 0.5);
+      bool belowEntry = isBuy ? (outPx < inPx - _Point) : (outPx > inPx + _Point);
+      if(InpReentry && !never && normal && stopExit && belowEntry && !SelectMyPosition())
         {
          GvSet("re_dir", isBuy ? 1.0 : -1.0);
          GvSetFlush("re_until", (double)(exitT + InpReWindowHours * 3600));
@@ -1186,7 +1222,8 @@ void ProcessClosedPositions()
       GvDel(StringFormat("tg_%I64d", id));
       GvDel(StringFormat("wk_%I64d", id));
       GvDel(StringFormat("ex_%I64d", id));
-      GvDel(StringFormat("r0_%I64d", id));
+      GvDel(StringFormat("ot_%I64d", id));
+      GvDel(StringFormat("xs_%I64d", id));
       GlobalVariablesFlush();
      }
   }
