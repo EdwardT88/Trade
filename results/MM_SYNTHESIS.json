@@ -1,0 +1,220 @@
+{
+ "recommended_config": "The maximum-return setup is the dev-selected PRIMARY, C7+KT, run on an Exness swap-free cent account. It was chosen by a dev-only rule and run on validation once. Each item below gives exact values.\n\n1) ACCOUNT\n- Use Exness Standard Cent (MT5, HEDGING mode), symbol XAUUSDc.\n- Before going live, check that swap long and swap short are both 0 in the symbol specification (Indonesian swap-free status).\n- If swap-free cannot be had, stay on HFM Cent. Use the HFM numbers below; the ranking is unchanged.\n- No paid VPS paid from the $50 account: $5-12/month ruins it. Use the broker's free VPS or a home PC.\n- IB rebates are worth about $0 at $50. Not worth setting up until equity is above about $200.\n\n2) SIZING 'KT' (rolling half-Kelly x pullback-depth tier). It replaces InpRiskPct, the ladder and the drawdown brake.\n- R = net profit of each closed position group (profit + swap + commission, the add included) / risk money of the first entry.\n- K step:\n  - Fewer than 15 closed groups: base = 2%.\n  - Otherwise, take x = the last min(n, 60) R values.\n  - k = mean(x) / max(sample variance(x), 0.5).\n  - base = clamp(0.5 x k, 1%, 6%).\n- T step (rsi_depth, measured at the signal bar):\n  - Long: rsi_depth = 40 - lowest RSI(14, H1) over the 10 completed H1 bars ending at the signal bar.\n  - Short: rsi_depth = highest RSI over the same bars - 60.\n  - Multiplier m = 1.5 if rsi_depth <= 1.826; 0.5 if rsi_depth > 4.905; otherwise 1.0.\n- Risk = base x m, so 0.5% to 9%.\n- Minimum-lot rule: keep InpMaxRiskAtMinLotPct = 3. At $50 with today's ~$73 stops, 0.01 lot already risks 1.47%, so the real floor is about 1.5% until equity is above about $75.\n- Start cold (2% for the first 15 groups). Seeding with the backtest's last 60 C7 R values gives about 2.1% on Exness (1.3% on HFM), which is almost the same.\n\n3) TRADE MANAGEMENT 'C7' = W1 + X1 + R2 + T2. Entries, the 2xATR(H4) stop and the 3xATR chandelier trail stay unchanged.\n- W1 (weekend hold, longs only):\n  - At Friday 20:00 UTC, if a LONG is at least +1.0R in profit (Bid - entry >= 1 x initial stop distance), do not close it.\n  - Move SL to max(SL, entry + 0.5R), keep trailing, and close at Tuesday 20:00 UTC.\n  - Shorts, and longs below +1R, close at the Friday close as now.\n- X1 (extend the 72h cap):\n  - At entry + 72h, if open P&L >= 0 and the last completed H4 bar's trend equals the trade direction, move SL to max(SL, entry) (breakeven).\n  - Hold until Friday 20:00 UTC. At that point W1 is checked again.\n  - Otherwise close as now.\n- R2 (one re-entry after a stop-out):\n  - Applies after a normal (non-re-entry) trade is stopped out below entry (above entry for shorts).\n  - For the next 48h, also accept an RSI(14, H1) cross up through 45 (down through 55 for shorts) in the same direction while the H4 trend agrees.\n  - Only one re-entry per stop-out. A re-entry that is stopped out does not arm another.\n  - Same time filters as normal entries. The normal 40/60 signal has priority.\n- T2 (one Turtle add):\n  - At entry, place a buy-stop (sell-stop) at fill +/- 1.0 x ATR(H4) at entry.\n  - Volume = max(minimum lot, floor(0.5 x first lots)).\n  - When it fills, move both stops to max(SL, add fill - 2.0 x ATR) (mirror for shorts). Stops are never loosened.\n  - Total open risk must stay <= 1.5 x the first entry's risk money.\n  - Both positions trail and close together.\n\n4) EA SETTINGS\n- InpRiskLadder = false.\n- InpDDReducePct = 100 (brake OFF). The default brake cuts the primary's 2013-26 result from $10,133 to $226.\n- InpDailyLossPct = 20. At 5%, 9 of the 31 re-entries would be blocked.\n- InpMaxTradesPerDay = 6, because the add counts as a trade.\n- InpHardStopPct = 30 (keep). The primary never hit it from a fresh $50 in any test period. It would have halted in 2 of 13 start years (HFM; 1 of 13 on Exness), against 9 of 13 for fixed 3% and 10 of 13 for the ladder.\n- InpFridayClose = true, InpMaxHoldDays = 3 (the W1 and X1 exceptions sit on top).\n\n5) MILESTONES AND WITHDRAWALS\n- Change nothing when the account doubles. No milestone rule beat sizing on the system's own recent R. The 5/3/2 ladder and 'withdraw 50% at each 2x' both lose on validation.\n- KT's risk does not depend on the equity level, so withdrawals and deposits do not change the risk %. The EA already shifts the hard-stop and peak baselines on balance operations.\n- Withdraw only for living money, not as a return lever.\n\n6) STATED RISK (backtest, HFM costs; Exness in brackets)\n- Max drawdown 55.5% (56.7%).\n- Longest time under water about 5 years (Jan 2018 to Mar 2023), in the single account; every configuration has this.\n- Worst single-trade loss -10% of equity. 14% of trades risk more than 6%.\n- Block bootstrap, 3 years / 150 trades from $50:\n  - Median $93 ($126), P10 $40 ($43), P90 $521 ($821).\n  - P(close below the -30% hard stop at some point) 9% (6%).\n  - P(ending below $50) 23% (16%).\n  - Fixed 3% for comparison: median $63, P10 $32, P(hit -30%) 30%, P(ending below $50) 33%.\n\n7) ROLLOUT ORDER\n- Stage 1, the robust core: Exness + brake off + KT + W1 (validation sum $1,438 / 2013-26 $4,695 / max DD 49% on Exness).\n- Verify it trade by trade in the MT5 tester against scripts/mm_combined.py.\n- Stage 2: add X1, T2 and R2 to complete C7.\n- R2 is the weakest piece. If anything is left out, leave out R2. Note that 'C7 without R2' was not validated as a choice.",
+ "combined_results": {
+  "how_computed": "Shared mm_sim simulator conventions: each period starts from a fresh $50; all = one account 2013-2026; validation_sum = 2020-21 + 2022-25 + 2026. Script: /home/user/Trade/scripts/mm_combined.py (deterministic, about 30 s). Full output: /tmp/claude-0/-home-user-Trade/e03777fa-c2bc-5e97-a6e8-e6745e2e9419/scratchpad/synth/combined_final.txt. PRIMARY = C7 management + KT sizing, chosen by a dev-only rule fixed before any validation run of the combination: the eligible (management, sizing) pair with the highest dev $ (eligible = beats EA + fixed 3% on dev and in both dev halves, never ruined, never below the -30% hard stop on dev). 27 pairs were tried on dev; 18 were eligible.",
+  "PRIMARY_C7_KT_HFM_costs": {
+   "dev": 623.98,
+   "val_2020_21": 37.77,
+   "val_2022_25": 1876.26,
+   "val_2026": 49.83,
+   "validation_sum": 1963.86,
+   "all_2013_2026": 10132.79,
+   "max_dd_all_pct": 55.5,
+   "max_dd_any_period_pct": 55.5,
+   "hard_stop_hit_from_fresh_50": "never",
+   "ruined": false,
+   "avg_risk_pct": 3.2
+  },
+  "PRIMARY_C7_KT_Exness_costs": {
+   "dev": 1164.6,
+   "val_2020_21": 39.91,
+   "val_2022_25": 3518.51,
+   "val_2026": 50.24,
+   "validation_sum": 3608.66,
+   "all_2013_2026": 32665.68,
+   "max_dd_all_pct": 56.7,
+   "hard_stop_hit_from_fresh_50": "never"
+  },
+  "references_HFM_EA_trades": {
+   "fixed_2pct": {
+    "dev": 58.68,
+    "validation_sum": 214.87,
+    "all": 106.13,
+    "max_dd_all_pct": 49.1
+   },
+   "fixed_3pct": {
+    "dev": 59.93,
+    "val_2020_21": 32.72,
+    "val_2022_25": 204.9,
+    "val_2026": 42.77,
+    "validation_sum": 280.39,
+    "all": 137.5,
+    "max_dd_all_pct": 64.7,
+    "hard_stop_hit": "dev, 2020-21"
+   },
+   "ladder_5_3_2": {
+    "dev": 84.61,
+    "val_2020_21": 23.61,
+    "val_2022_25": 252.47,
+    "val_2026": 38.19,
+    "validation_sum": 314.27,
+    "all": 213.76,
+    "max_dd_all_pct": 74.4,
+    "hard_stop_hit": "dev, 2020-21"
+   }
+  },
+  "references_Exness_EA_trades": {
+   "fixed_2pct": {
+    "dev": 75.39,
+    "validation_sum": 236.28,
+    "all": 170.64,
+    "max_dd_all_pct": 39.2
+   },
+   "fixed_3pct": {
+    "dev": 87.15,
+    "validation_sum": 327.26,
+    "all": 279.51,
+    "max_dd_all_pct": 53.8
+   },
+   "ladder_5_3_2": {
+    "dev": 112.06,
+    "validation_sum": 358.99,
+    "all": 316.53,
+    "max_dd_all_pct": 60.1
+   }
+  },
+  "primary_vs_fixed3_per_period_HFM": "dev 10.4x, 2020-21 +15%, 2022-25 9.2x, 2026 +17%. It wins all four periods. On validation_sum it ranks 1 of 28 grid configs at both cost sets. Spearman rank correlation between dev $ and validation_sum across the grid is 0.90 (HFM) and 0.93 (Exness).",
+  "robust_core_W1_KT": {
+   "HFM": {
+    "dev": 201.67,
+    "validation_sum": 928.76,
+    "all": 1635.68,
+    "max_dd_all_pct": 47.4
+   },
+   "Exness": {
+    "dev": 327.42,
+    "validation_sum": 1438.26,
+    "all": 4694.56,
+    "max_dd_all_pct": 49.3
+   }
+  },
+  "robustness_of_primary": {
+   "cent_lots_0.01_steps_incl_add_rounding_HFM": "dev 601.68 / val 1856.61 / all 9714.61 / max DD 55.0%; no trades skipped",
+   "cent_lots_Exness": "1122.76 / 3395.43 / 31172.46",
+   "with_EA_minus30_halt_no_reset": "Never halts in the 4 periods. Fixed 3% halts in dev ($34.84) and 2020-21; the ladder halts in dev ($33.53) and 2020-21. Fresh $50 on 1 Jan of each start year 2013-2025, with the halt: primary halts in 2/13 (HFM) and 1/13 (Exness); fixed 3% in 9/13; ladder in 10/13.",
+   "warm_start_validation_sum": "HFM 1113.73, Exness 1766.54 (K alone 453.02; fixed 3% 280.39)",
+   "costs_x1.5_spread_slippage_swap5": "dev 443.67 / val 1799.81 / all 6697.30 / DD 47.6% (fixed 3%: 53.55 / 273.49 / 117.16)",
+   "Exness_swapfree_revoked": "593.22 / 2053.24 / 10159.73",
+   "Exness_spread_x1.125": "1147.77 / 3368.45 / 29959.85",
+   "start_years": "Beats fixed 3% and the ladder in 13/13 start years (2013-2025), at both cost sets.",
+   "block_bootstrap_150_trades_block40_all_trades": "Primary HFM: median 93.3, P10 39.7, P90 521.4, P(hit -30%) 9%, P(below $50) 23%. Primary Exness: 125.7 / 43.2 / 821.3 / 6% / 16%. Fixed 3% HFM: 63.4 / 32.2 / 128.3 / 30% / 33%. Ladder: 71.2 / 22.4 / 174.4 / 50% / 36%.",
+   "block_bootstrap_dev_pool_2013_19_like_future": "Primary HFM median 75.3, P10 37.5, P(hit -30%) 14% vs fixed 3%: 53.6, 28.4, 35%",
+   "regime_dependence_of_K": "With block 10 (regimes broken up), K alone has median 56.1 vs fixed 3% 64.0, but P(hit -30%) is 14% vs 25%. The primary still wins at blocks 10/40/120.",
+   "time_under_water": "Longest 1,886 days (2018-01-25 to 2023-03-27), single account HFM. Fixed 3%: 2,262 days.",
+   "risk_used": "Median 2.26% (HFM); 43% of trades at <=1.5%, 14% above 6%, 6% at 9%; worst single-trade loss -10.0% of equity.",
+   "EA_default_DD_brake_on": "Primary HFM: dev 58.06 / val 447.97 / all 225.60. The brake must be off.",
+   "parameter_neighbours_post_hoc": "12 variants (K window 40/60/80, cap 4/6%, tiers 1.5/0.5 or 1.25/0.75) on C7 HFM: val_sum 961-2202, all 1980-10133, DD 52-64%. All far above fixed 3%. The frozen W60/6%/1.5-0.5 is the top on dev and on all-history, so the magnitude is optimistic.",
+   "growth_source_single_account_HFM": "dev x12.5 (48% of log growth), 2020-21 x0.81, 2022-25 x20.5 (57%), 2026 x0.98",
+   "current_state": "Seeded with the full history, the next trade's K base is 1.31% (HFM) / 2.09% (Exness), times the tier. At $50 the minimum lot risks 1.47%."
+  },
+  "post_hoc_ablation_NOT_validated": {
+   "C6_W1_X1_T2_noR2_plus_KT_HFM": {
+    "dev": 222.83,
+    "validation_sum": 2756.08,
+    "all": 4856,
+    "max_dd_all_pct": 50.8
+   },
+   "C6_plus_KT_Exness": {
+    "dev": 447.16,
+    "validation_sum": 4957.46,
+    "all": 16117.47,
+    "max_dd_all_pct": 49.6
+   },
+   "reading": "R2 adds about $400 on dev but lowers every validation period inside the stack. R2 is probably fitted to dev."
+  }
+ },
+ "levers_ranked": [
+  {
+   "lever": "Sizing KT = rolling half-Kelly W60 (clip 1-6%) x rsi_depth tier 1.5/1/0.5",
+   "effect": "Alone on EA trades, HFM, vs fixed 3%: dev 59.93->167.54, val_sum 280.39->745.09, all 137.50->1078.06, max DD 65%->40%. Better in all 4 periods (worst ratio 1.10, geometric-mean period ratio 1.90). At x1.5 costs, all-history 117->807. Inside the primary, removing K (C7+T) cuts val_sum 3609->1032; removing T (C7+K) cuts it 3609->2993.",
+   "robust": true
+  },
+  {
+   "lever": "Sizing K alone: mm_sizing 'C' rolling half-Kelly over the last 60 R",
+   "effect": "val_sum 280->588, all 138->602, DD 65%->43%. 4/4 periods better, gm ratio 1.56. Cent lots $575; warm-start val 453. It is a regime-persistence bet: in a block-10 bootstrap its median ($56) is below fixed 3% ($64), although its P(hit -30%) is lower (14% vs 25%). It lags at turns: still at ~1% through 2022, and at 3-4% in losing 2026.",
+   "robust": true
+  },
+  {
+   "lever": "Account: Exness Standard Cent, swap-free + spread x0.75 (spread unverified)",
+   "effect": "+0.040R per trade. Fixed 3%: dev 60->87, val_sum 280->327, all 138->280, DD 65%->54%. 4/4 periods better, gm 1.19. Swap-free alone gives +0.033R (gm 1.16); spread x0.75 alone +0.007R (gm 1.03). In the primary it is worth x1.8 on val_sum and x3.2 on all-history. It disappears if swap-free status is revoked.",
+   "robust": true
+  },
+  {
+   "lever": "Sizing T alone: mm_conviction C1 rsi_depth tiers 1.5/1/0.5 at 3%",
+   "effect": "val_sum 280->344, all 138->290, DD 65%->59%. 3/4 periods better (2026 0.99), gm 1.20. Out-of-sample shallow-minus-deep +0.36R, p 0.018. Weak on dev (null p 0.73, non-monotone). Inside C7, shallow beats deep in all 4 periods.",
+   "robust": true
+  },
+  {
+   "lever": "Management W1: weekend hold for longs at >= +1R, SL to +0.5R, close Tuesday 20:00 UTC",
+   "effect": "+0.025R per trade. Fixed 3%: dev 60->73, val_sum 280->317, all 138->205, DD unchanged at 65%. No period worse, gm 1.11; holds at x1.5 costs (117->175). Research-phase checks used the full sample, so validation was not fully blind.",
+   "robust": true
+  },
+  {
+   "lever": "EA drawdown brake OFF (InpDDReducePct=100)",
+   "effect": "The default brake (DD >= 10% -> 1%) costs a lot. Fixed 3% all-history 138->54. Primary all-history 10,133->226. It helps a little in 2020-21 and 2026, so it fails the per-period test. It is redundant with K, which already de-risks. Turning it off is required for every recommended policy.",
+   "robust": false
+  },
+  {
+   "lever": "Management C7 stack (W1+X1+R2+T2)",
+   "effect": "Alone at fixed 3%: val_sum 280->638, all 138->563, but DD 65%->80%, and 2020-21 ratio 0.67 (gm 1.42). Inside KT on Exness, vs EA+KT: val_sum 1092->3609, all 3138->32666, DD 45%->57%, 2020-21 ratio 0.89 (gm 1.92). It is the largest return lever, and it is a trend-regime bet: the stack's 2021 is -12R vs the EA. K partly protects it by cutting risk in bad regimes.",
+   "robust": false
+  },
+  {
+   "lever": "Management C1 = W1+X1",
+   "effect": "Fixed 3%: val_sum 280->382, all 138->290, DD 68%. 2020-21 ratio 0.89, gm 1.21. W1 benefits because X1 keeps more trades open into Friday.",
+   "robust": false
+  },
+  {
+   "lever": "Management T2: Turtle add 0.5x at +1 ATR (all stops to fill - 2 ATR)",
+   "effect": "Fixed 3%: val_sum 280->402, all 138->232, DD 72%. Worse in 2020-21 (0.86) and 2026, gm 1.14. All of the gain is in 2015-17 and 2022-25. It is a cousin of the +1R pyramid that failed earlier. At $50 the add is the minimum lot, i.e. 1.0x and not 0.5x (the cent-lot sim includes this).",
+   "robust": false
+  },
+  {
+   "lever": "Management X1: extend the 72h cap to Friday if >= 0R (SL to breakeven)",
+   "effect": "Fixed 3%: val_sum +$6.5, all 138->150. 2020-21 ratio 0.89, gm 1.02. Noise alone; it only helps as a feeder for W1.",
+   "robust": false
+  },
+  {
+   "lever": "Management R2: one re-entry after a stop-out (RSI 45/55 within 48h)",
+   "effect": "Failed validation alone (val_sum 270 < 280). Post hoc inside the stack: C6+KT (no R2) has val_sum 2756 vs C7+KT 1964 and is better in all 3 validation periods, but has a much lower dev result (223 vs 624). It is the least reliable part of the primary, and 9 of its 31 re-entries need InpDailyLossPct raised.",
+   "robust": false
+  },
+  {
+   "lever": "Ladder 5/3/2 at 2x/4x ('change risk every time the account doubles')",
+   "effect": "Fixed 3% -> ladder: val_sum 280->314, all 138->214, but DD 65%->74%. 2020-21 ratio 0.72, gm 1.03. It hits the -30% hard stop in dev and 2020-21, and its thresholds were chosen after seeing all the data. With the EA's halt modelled it halts in 10 of 13 start years. All 9 ladder variants failed dev.",
+   "robust": false
+  },
+  {
+   "lever": "Withdrawals at milestones (take 50% at each 2x, take 33%, free-roll, sweeps)",
+   "effect": "Take 50% at each 2x (fixed 3%): val_sum 280->228, all 138->119. Ladder + take 33% fails validation (233). Withdrawals raise the median slightly but lower the mean and the upper tail. Not a return lever.",
+   "robust": false
+  },
+  {
+   "lever": "Deposits (DCA $10/month, refill to $50)",
+   "effect": "They add dollars, not return: IRR is below no-DCA in every validation period. Refill-to-$50 is a capped averaging-down that made 2020-21 worse.",
+   "robust": false
+  },
+  {
+   "lever": "IB rebates",
+   "effect": "About +0.0085R in theory, but only $5-10 paid over 13 years at $50, because sub-cent rebates are not paid. Worth it from about $200 equity.",
+   "robust": false
+  },
+  {
+   "lever": "Other sizing families: A/A2 equity-curve throttles, fixed ratio, Grossman-Zhou/CPPI floors, house money, streak anti-martingale, DD de-risking, cushion gate, static/bootstrap Kelly, vol targeting",
+   "effect": "A and A2 pass validation only marginally (+3%) and are dominated by K. Fixed ratio and vol targeting fail validation. The rest fail dev. Dev Kelly is 3.0%, so fixed 3% is already full dev Kelly.",
+   "robust": false
+  },
+  {
+   "lever": "Exit tweaks: partial TP + runner, stale-trade exit, cooldown after a stop-out, breakeven-plus, tighter or looser trails, fixed TPs",
+   "effect": "All fail on dev, or failed earlier, against the 3xATR chandelier.",
+   "robust": false
+  },
+  {
+   "lever": "Paid VPS paid from the $50 account",
+   "effect": "$12/month ruins the account in every period and base; $5/month ruins it in 3 of 4 periods.",
+   "robust": false
+  }
+ ],
+ "needs_ea_change": "Changes to mql5/GoldSwingCent.mq5 for C7 + KT. Today the EA has single-position logic, InpRiskPct capped at 5 in OnInit, the ladder and the DD brake.\n\nA) INPUTS AND OnInit\n- Add InpKellySizing=true, InpKellyWindow=60, InpKellyFrac=0.5, InpKellyVarFloor=0.5, InpKellyMinPct=1.0, InpKellyMaxPct=6.0, InpKellyWarmPct=2.0, InpKellyMinTrades=15.\n- Add InpDepthTiers=true, InpDepthBars=10, InpDepthCutLo=1.826, InpDepthCutHi=4.905, InpDepthMultHi=1.5, InpDepthMultLo=0.5.\n- Add InpWeekendHold=true, InpWkMinR=1.0, InpWkLockR=0.5, InpWkHours=96, InpWkLongOnly=true.\n- Add InpCapExtend=true, InpExtMinR=0.0, InpExtLockR=0.0, InpExtNeedTrend=true.\n- Add InpReentry=true, InpReRsiLevel=45, InpReWindowH=48.\n- Add InpTurtleAdd=true, InpAddATR=1.0, InpAddFrac=0.5, InpAddStopATR=2.0, InpMaxGroupRisk=1.5.\n- Optional: InpSeedRFile.\n- Change defaults: InpDDReducePct=100, InpRiskLadder=false, InpDailyLossPct=20, InpMaxTradesPerDay=6.\n- Relax the OnInit check 'InpRiskPct > 5' when InpKellySizing is on: allow InpKellyMaxPct x InpDepthMultHi <= 12.\n- Refuse InpTurtleAdd on a netting account: it needs ACCOUNT_MARGIN_MODE_RETAIL_HEDGING.\n\nB) GROUP STATE\n- Store GlobalVariables keyed by the FIRST position id at OpenTrade:\n  - sl0 = initial stop distance (2xATR).\n  - atr0.\n  - risk0 = lots x LossPerLot(sl0 + InpRiskBufferUSD).\n  - dir.\n  - tag (0 = normal, 1 = re-entry).\n  - wk_deadline, ext_flag, add_done.\n- The add position carries the group id in its order comment ('GSW add <id>') so it can be found again after a restart.\n- SelectMyPosition, CloseAll, CloseAllThrottled, UpdatePeak, FloatingPnL and CanOpenNewTrade must treat 'any position OR pending order with InpMagic on _Symbol' as the group.\n- CloseAll must also delete the pending add order.\n\nC) R HISTORY\n- When the LAST position of a group closes (OnTradeTransaction / OnClosedDeal): R = sum over all deals of the group's positions of (DEAL_PROFIT + DEAL_SWAP + DEAL_COMMISSION), including the IN-deal commissions, divided by risk0.\n- Append time, R, dir, tag and a stop-loss flag to Common/Files/GoldSwingCent_R_<login>.csv.\n- The stop-loss flag is true when the first position was closed by DEAL_REASON_SL at a price worse than its entry.\n- Keep the last InpKellyWindow values in memory, loaded in OnInit, optionally seeded from InpSeedRFile.\n- Also keep last_exit_time, last_dir, last_tag and last_sl_loss for R2.\n\nD) SIZING (LotsForRisk)\n- Replace baseRisk and the brake with:\n  - base = (n < 15) ? 2.0 : clamp(100 x 0.5 x mean(x) / max(var_sample(x), 0.5), 1.0, 6.0), where x = the last min(n, 60) R values;\n  - riskPct = base x mult.\n- mult comes from CheckEntrySignal:\n  - CopyBuffer(g_hRsi, 0, 1, 10, buf), i.e. the signal bar and the 9 completed bars before it.\n  - Long: depth = 40 - min(buf). Short: depth = max(buf) - 60. The 40/60 reference is also used for re-entries.\n  - mult = 1.5 if depth <= 1.826; 0.5 if depth > 4.905; otherwise 1.0.\n- Keep the minimum-lot rule (InpMaxRiskAtMinLotPct=3) and the margin check.\n- Do NOT apply InpReducedRiskPct.\n\nE) R2 IN CheckEntrySignal\n- Besides the 40/60 cross, if InpReentry is on and all of the following hold, also accept RSI[prev] < 45 <= RSI[now] for longs (RSI[prev] > 55 >= RSI[now] for shorts):\n  - last_tag == 0;\n  - last_sl_loss is true;\n  - TimeCurrent - last_exit_time <= 48h;\n  - H4TrendEx == last_dir.\n- The direction must be last_dir. Open it with tag 1.\n- The normal signal has priority. A tag-1 group never arms another re-entry.\n- Apply the same Friday cutoff, no-entry hours and 5-minute delay rules as normal entries.\n\nF) ManagePosition, rewritten for the group\n- Trail: the chandelier distance 3 x atr0 from the highest Bid since the FIRST open (lowest Ask for shorts). Apply it to every position of the group; never loosen a stop.\n- Friday-close branch (Fri >= 20:00 UTC, or weekend):\n  - If InpWeekendHold, the group is long, wk_deadline is unset, and (Bid - open1) >= 1.0 x sl0: set wk_deadline = this Friday 20:00 UTC + 96h, move every SL to max(SL, open1 + 0.5 x sl0), and do not close.\n  - While wk_deadline is set, skip the Friday/weekend close and the max-hold close, and CloseAll at wk_deadline (Tuesday 20:00 UTC).\n  - Keep the holiday extra-flat closes.\n- Max-hold branch (TimeCurrent - open1 >= 72h):\n  - If InpCapExtend and ext_flag is unset, open P&L >= 0 (Bid >= open1 for longs, Ask <= open1 for shorts) and H4TrendEx == dir: set ext_flag, move every SL to max(SL, open1), and hold to the Friday 20:00 close, where the W1 test runs again.\n  - Otherwise close all.\n\nG) T2 ADD\n- Right after the first fill, place a BUY STOP (SELL STOP) at open1 +/- 1.0 x atr0 with volume = max(vmin, floor(0.5 x lots1 / vstep) x vstep) and no SL.\n- Reduce the volume so that the open risk to the new stop is <= 1.5 x risk0. If even vmin does not fit, do not place the order.\n- On fill (OnTradeTransaction, DEAL_ENTRY_IN of the add): newSL = max(curSL, addFill - 2.0 x atr0) for longs (min for shorts). PositionModify both positions.\n- Only one add per group. Delete the pending order when the first position closes.\n\nH) VERIFY BEFORE LIVE\n- Run the MT5 tester on Exness XAUUSDc M1 (real ticks) for 2022-2025.\n- Compare trade by trade (entry/exit time, R, exit reason, adds, weekend holds) with trades('C7', 'EXN') and the risk % per trade from scripts/mm_combined.py.",
+ "caveats": "1) Re-run results.\n- All four cluster scripts reproduce their reported numbers exactly: sizing C/B/A/A2, conviction C1-C5, management finals including its engine-equivalence check (603 trades identical, swap-free too), and the account tables.\n- I found no look-ahead:\n  - The trades never overlap (0 entries before the previous exit, in the EA list and in C7), so R-history policies only see closed trades.\n  - rsi_depth uses H1 bars completed at the signal close and dev-only cut points.\n  - The weekend-hold, extension and add decisions use the bar-open price at the decision time and completed H4 bars (align_htf_to_m1).\n  - Same-bar add-and-stop cases are scored pessimistically.\n- Design-level look-ahead: the 5/3/2 ladder (and B and C4 built on it) uses thresholds picked after seeing all data. W1 and X1 came from full-sample quick checks.\n\n2) The references are optimistic.\n- mm_sim ignores the EA's -30% halt, the daily-loss limit and the DD brake.\n- With the halt modelled, fixed 3% ends dev at $34.84 and halts in 9 of 13 start years; the ladder halts in 10 of 13.\n\n3) The combination's validation is not blind.\n- The primary was picked by a dev-only rule that I fixed before running it on validation.\n- But I had read every cluster's validation numbers, so the component set had already been filtered by validation: R2 was not offered alone, and the ladder-based options were excluded.\n\n4) The dev figure is inflated by selection.\n- Dev $624 vs $60 is the best of 27 combinations of cluster winners, each picked from 29-48 dev combos.\n- Validation confirms the ordering (rank 1 of 28; dev/validation Spearman 0.90), not the size.\n\n5) The magnitudes are compounding artifacts.\n- $10k (HFM) and $33k (Exness) from $50 over 13 years should not be read as forecasts.\n- Sizing neighbours give $2k-10k.\n- A realistic 3-year view is the bootstrap: median about $93-126 from $50, P10 about $40-43, P(hitting -30%) 6-9%, P(ending below $50) 16-23%. In a 2013-19-like future: median $75, P(hitting -30%) 14%.\n\n6) It is one regime bet in several layers.\n- 57% of the single-account log growth comes from 2022-25, and validation_sum is dominated by that one gold trend.\n- K, T2, X1 and W1 all amplify trends.\n- In the weak periods the primary's edge over fixed 3% is small in dollars: +$5 in 2020-21, +$7 in 2026.\n- Every configuration spent about 5 years under water (Jan 2018 to Mar 2023).\n- With regime persistence removed (bootstrap block 10), K alone has a lower median than fixed 3%.\n\n7) R2 is suspect.\n- It failed validation alone.\n- Post hoc, the stack without R2 (C6+KT) is better in all 3 validation periods (val_sum $2,756 vs $1,964) but much worse on dev.\n- R2 is kept only because the protocol picked C7 on dev.\n\n8) T's evidence rests on one validation run (p 0.018). Dev was weak (null p 0.73), and at fixed 3% the effect flips in 2026 (24 trades).\n\n9) Risk per trade.\n- Up to 9%. 14% of trades risk more than 6%. The worst single trade was -10% of equity.\n- At $50 with 2026 stops (~$73), the minimum lot already risks 1.47%, so the 1% floor and the 0.5x tier do nothing until equity passes about $75.\n\n10) The EA defaults break the result.\n- The DD brake turns the primary's $10,133 into $226.\n- InpDailyLossPct=5 would block 9 of the 31 re-entries.\n- OnInit rejects any risk above 5%.\n\n11) Implementation risk is the biggest practical caveat.\n- C7 needs two-position group handling, pending orders, weekend holds and re-entries.\n- The backtest assumes an exact port. Verify trade by trade in the MT5 tester first. A staged rollout (KT + W1 first) limits the damage from bugs.\n\n12) Data.\n- 2013-2021 are H1 bars only, so intrabar order is approximated (pessimistically).\n- 2026 is 24 trades starting 2026-03-26.\n\n13) Broker facts are unverified.\n- The Exness XAUUSDc spread (x0.75) and swap-free status are not verified. If swap-free is revoked, use the HFM-cost numbers.\n- Exness is not licensed by Bappebti.\n\n14) Housekeeping.\n- My only file is /home/user/Trade/scripts/mm_combined.py. Someone else committed it as WIP commit fb0bd4f while I worked; the working copy adds a 10-line docstring section on top. I ran no git commands that change state.\n- My first background run accidentally wrote two log files to /. I moved them to the scratchpad; nothing is left there.\n- Full outputs are in /tmp/claude-0/-home-user-Trade/e03777fa-c2bc-5e97-a6e8-e6745e2e9419/scratchpad/synth/ (combined_final.txt, sizing.txt, conviction.txt, mgmt_final.txt, account.txt)."
+}

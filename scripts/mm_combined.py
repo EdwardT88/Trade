@@ -26,6 +26,16 @@ Selection rule for the combination. It was fixed before any combination was run 
 Conventions are the same as scripts/mm_sim.py: each period starts from a fresh $50, and all = one account 2013-2026.
 validation_sum = 2020-21 + 2022-25 + 2026. Sizing is continuous unless a table says "cent lots".
 
+Output sections:
+  1. dev selection
+  2. the primary vs fixed 2% / fixed 3% / ladder, plus the whole grid on validation for context
+  3. robustness of the primary: cent lots and the -30% halt, warm start, costs, start year, block bootstrap,
+     year by year, current risk, EA drawdown brake
+  4. lever ranking: each lever alone from EA + fixed 3%, and leave-one-out from the primary
+  5. post-hoc diagnostics: time under water, start year with the halt, risk used, ablations (C6 = no R2, robust core
+     W1+KT), sizing-parameter sensitivity, and where the growth came from
+Sections 3-5 are information only; nothing in them changes the primary. Runs in about 30 s.
+
     python scripts/mm_combined.py
     python scripts/mm_combined.py --dev-only     # selection stage only
 """
