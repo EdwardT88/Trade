@@ -13,20 +13,38 @@ Panduan pasang dan jalanin EA `mql5/GoldSwingCent.mq5` di akun **cent** MT5 deng
   Kalau nggak jelas, EA diam.
 - **Entry di H1:** nunggu harga koreksi dulu. RSI(14) H1 turun di bawah 40, terus balik naik nembus 40 → BUY.
   Untuk SELL kebalikannya (nembus 60 ke bawah).
-- **Stop loss:** 2 × ATR(14) H4. Lot dihitung otomatis supaya kalau kena SL ruginya 2% equity.
+- **Stop loss:** 2 × ATR(14) H4. Lot dihitung otomatis dari risk % (lihat "Ukuran risk" di bawah).
 - **Trailing stop:** 3 × ATR. Mulai ngunci profit setelah harga jalan sekitar +1 ATR, nggak pernah mundur.
-- **Posisi maksimal 3 hari**, dan **semua ditutup tiap Jumat 20:00 UTC** (Sabtu 03:00 WIB). Nggak bawa posisi lewat weekend.
+- **Posisi maksimal 3 hari**, dan ditutup tiap **Jumat 20:00 UTC** (Sabtu 03:00 WIB). Pengecualian (v1.10):
+  posisi **BUY yang udah profit ≥ 1R** boleh dibawa lewat weekend, SL-nya dikunci di **+0,5R** (profit setengah risk
+  udah aman), trailing tetap jalan, dan ditutup paling lambat **Selasa 20:00 UTC**. Ini butuh akun **swap-free**.
 - Nggak buka posisi baru jam 21:00–24:00 UTC (04:00–07:00 WIB, jam spread lebar) dan Jumat setelah 12:00 UTC.
 - Satu posisi dalam satu waktu. Rata-rata ±4 trade per bulan, posisi rata-rata ditahan ±1,5 hari (maks 3 hari).
 
 Jadi ini **swing**, bukan scalping. Scalping udah dites dan kalah sama spread (detail di `docs/HASIL_BACKTEST.md`).
 
+### Ukuran risk (v1.10: "Kelly × kedalaman pullback")
+
+- **Base risk** dihitung ulang tiap trade dari **60 trade terakhir yang udah ketutup**: setengah Kelly
+  (`0,5 × rata-rata R / varians R`), dibatasi **1%–6%**. Selama belum ada 15 trade ketutup, base risk **2%**.
+  Artinya: lagi bagus → risk naik sendiri, lagi jelek → risk turun sendiri.
+- **Pengali kedalaman:** koreksi RSI yang dangkal (sinyal paling bagus di riset) × 1,5, normal × 1, koreksi dalam × 0,5.
+- Jadi risk per trade antara **0,5% dan 9%**. Panel di chart nunjukin base risk sekarang.
+- Rem drawdown (risk turun waktu DD) sekarang **default mati**: di riset rem ini makan lebih dari setengah return.
+
+Hasil riset (simulasi $50, 2013–2026, biaya Exness, swap-free): versi Inti ini **±39%/tahun**, drawdown maks **±49%**.
+Bandingin: risk tetap 3% cuma ±8%/tahun. Paket agresif di riset (C7) ±60%/tahun dengan DD ±57%, tapi itu termasuk
+"Turtle add" yang **belum** ada di EA. **Catatan jujur:** 2020–2021 rugi, 2026 datar, dan angka riset selalu
+kebagusan dibanding live (bias seleksi). Drawdown 50% itu beneran bakal kejadian: $100 bisa jadi $50 dulu.
+Hard stop (−30% dari saldo awal) dan rem harian **nggak** ada di simulasi itu: kalau awal-awal langsung kena
+beberapa SL, EA bisa HALT sebelum sempat naik. Itu disengaja (pengaman), bukan bug.
+
 ### Aturan anti-MC (selalu aktif)
 
 | Aturan | Default | Artinya |
 |---|---|---|
-| Risk per trade | 2% equity | Kena SL = rugi ±2%. |
-| Risk saat drawdown | 1% | Equity turun 10% dari puncak → risk 1% sampai cetak puncak baru. |
+| Risk per trade | Kelly 1–6% × 0,5/1/1,5 | Lihat "Ukuran risk" di atas. Mode lama (risk tetap) = `InpKellySizing = false`. |
+| Risk saat drawdown | mati (`InpDDReducePct = 100`) | Isi misal 10 kalau mau risk turun ke `InpReducedRiskPct` waktu equity 10% di bawah puncak. |
 | Skip kalau lot minimum kegedean | 3% | Kalau 0.01 lot aja udah risk >3%, trade nggak diambil. |
 | Stop harian | −5% | Rugi 5% dalam sehari (UTC) → nggak buka posisi baru sampai besok. |
 | Loss beruntun | 3x | Kalah 3x berturut-turut di hari yang sama → stop sampai besok. |
@@ -45,6 +63,8 @@ Nggak ada martingale, grid, averaging, atau posisi tanpa SL.
 ## 2. Persiapan akun
 
 1. Buka akun **cent** di MT5 (lihat `docs/BROKER.md`). Simbol gold di akun cent biasanya **`XAUUSDc`**.
+   Rekomendasi: **Exness Standard Cent** (akun Indonesia otomatis **swap-free**, penting buat weekend hold).
+   Kalau akun lu kena swap, set `InpWeekendHold = false`.
 2. Leverage: **1:500 atau 1:1000** udah lebih dari cukup. Lot di EA ini kecil (±0.02–0.05 lot cent),
    jadi margin-nya cuma beberapa sen.
 3. Deposit $50 → di MT5 kelihatan **5000** (USC).
@@ -88,8 +108,9 @@ Cek di panel kiri atas chart: `UTC hh:mm` harus sama dengan jam UTC sekarang (= 
 
 - Jalanin di **demo** (atau akun cent live dengan risk 1% dulu kalau broker nggak punya demo cent, misalnya Exness)
   selama 2–4 minggu.
-- Lolos kalau: nggak ada error eksekusi di tab *Experts/Journal*, lot sesuai (risk ±2%), SL selalu kepasang, trailing jalan,
-  dan posisi ketutup Jumat malam.
+- Lolos kalau: nggak ada error eksekusi di tab *Experts/Journal*, lot sesuai risk di panel, SL selalu kepasang,
+  trailing jalan, posisi ketutup Jumat malam (atau ditahan sampai Selasa kalau BUY profit ≥ 1R, dengan SL di +0,5R),
+  dan tiap posisi ketutup muncul log `Position ... closed: ... R. Kelly history ...`.
 - Baru jalanin live $50 dengan setting yang sama.
 
 ## 6. Kalau EA "HALTED"
@@ -106,14 +127,20 @@ Artinya equity udah turun 30% dari saldo awal. EA nutup semua posisi dan berhent
 
 | Input | Default | Keterangan |
 |---|---|---|
-| `InpRiskPct` | 2.0 | Risk per trade (%). Minimal 1%, maksimal yang gua sarankan 3%. |
+| `InpKellySizing` | true | Risk dari 60 trade terakhir (half-Kelly 1–6%). `false` = pakai `InpRiskPct` tetap. |
+| `InpKellyWindow` / `InpKellyFrac` / `InpKellyMinPct` / `InpKellyMaxPct` / `InpKellyWarmPct` / `InpKellyMinTrades` | 60 / 0.5 / 1 / 6 / 2 / 15 | Setelan Kelly hasil riset. Jangan diubah tanpa backtest ulang. |
+| `InpDepthTiers` | true | Pengali risk dari kedalaman koreksi RSI: dangkal × 1,5, dalam × 0,5 (`InpDepthCutLo/Hi` = 1.826 / 4.905). |
+| `InpWeekendHold` | true | BUY yang profit ≥ `InpWkMinR` (1R) dibawa lewat weekend, SL dikunci +`InpWkLockR` (0,5R), tutup `InpWkHours` (96) jam setelah Jumat 20:00. **Matiin kalau akun kena swap.** |
+| `InpCapExtend` | **false** | Agresif: di batas 3 hari, kalau posisi nggak rugi dan tren H4 masih searah, SL ke BE dan tahan sampai Jumat. |
+| `InpReentry` | **false** | Agresif: habis kena SL rugi, 48 jam ke depan boleh masuk lagi arah yang sama di cross RSI 45/55. |
+| `InpRiskPct` | 2.0 | Risk tetap (%), cuma dipakai kalau `InpKellySizing = false`. |
 | `InpRiskLadder` / `InpRiskAt2x` / `InpRiskAt4x` | off / 3.0 / 2.0 | Tangga risk: pakai `InpRiskPct` (misal 5) sampai saldo 2× saldo awal, lalu 3%, lalu 2% setelah 4×. Lebih agresif di awal (drawdown awal bisa 60–80%), makin kalem waktu akun udah gede. Lihat `scripts/money_management_check.py`. |
 | `InpSides` | Long and short | `Long only` = cuma BUY (lebih bagus di 2024–2025, tapi itu taruhan gold terus naik). |
 | `InpStopATR` / `InpTrailATR` | 2.0 / 3.0 | Jarak SL dan trailing (× ATR H4). Jangan diubah tanpa backtest ulang. |
 | `InpTrendEMA` / `InpRsiLevel` | 40 / 40 | Parameter strategi hasil riset. |
 | `InpMaxHoldDays` | 3 | Posisi ditutup paling lama setelah 3 hari. Lebih pendek dari ini profit turun (lihat `docs/HASIL_BACKTEST.md`). |
 | `InpFridayClose` | true | Tutup Jumat 20:00 UTC. |
-| `InpReducedRiskPct` / `InpDDReducePct` | 1.0 / 10 | Risk turun waktu drawdown. |
+| `InpReducedRiskPct` / `InpDDReducePct` | 1.0 / 100 | Rem drawdown (100 = mati). |
 | `InpDailyLossPct` / `InpMaxConsecLosses` | 5 / 3 | Rem harian. |
 | `InpHardStopPct` | 30 | Hard stop dari saldo awal. |
 | `InpServerTZ` / `InpFixedOffsetHours` | Auto / 0 | Zona waktu server (lihat tabel di atas). |

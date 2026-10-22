@@ -10,13 +10,19 @@
 //|   - stop 2 x ATR(14, H4); chandelier trail 3 x ATR updated on    |
 //|     every closed M1 bar; flat every Friday 20:00 UTC             |
 //|                                                                  |
-//|   Risk first: fixed % risk per trade, min-lot risk cap, daily    |
-//|   loss stop, loss-streak stop, drawdown risk reduction and an    |
-//|   equity hard stop that halts the EA until a human reviews it.   |
+//|   v1.10 sizing: rolling half-Kelly on the last 60 closed R       |
+//|   (1-6%), x1.5 / x1 / x0.5 by the RSI pullback depth; winning    |
+//|   longs may be held over the weekend with the stop locked at     |
+//|   +0.5R (needs a swap-free account). Optional: cap extension and |
+//|   re-entry after a stop-out (research package C7, minus the add).|
+//|                                                                  |
+//|   Risk first: min-lot risk cap, daily loss stop, loss-streak     |
+//|   stop, optional drawdown risk reduction and an equity hard      |
+//|   stop that halts the EA until a human reviews it.               |
 //|   No martingale, no grid, no averaging, every trade has a stop.  |
 //+------------------------------------------------------------------+
 #property copyright "edwardt88/trade"
-#property version   "1.00"
+#property version   "1.10"
 #property description "XAUUSD H4-trend / H1-pullback swing EA for cent accounts with strict anti-margin-call rules."
 
 #include <Trade/Trade.mqh>
@@ -60,7 +66,7 @@ input double InpReducedRiskPct     = 1.0;    // Risk while in drawdown (%)
 input bool   InpRiskLadder         = false;  // Risk ladder: InpRiskPct until the balance doubles, then step down
 input double InpRiskAt2x           = 3.0;    // ... risk once the balance is >= 2x the start balance (%)
 input double InpRiskAt4x           = 2.0;    // ... risk once the balance is >= 4x the start balance (%)
-input double InpDDReducePct        = 10.0;   // Drawdown from peak equity that switches to reduced risk (%)
+input double InpDDReducePct        = 100.0;  // Drawdown from peak that switches to reduced risk (%; 100 = off: the brake cost > half the return)
 input double InpMaxRiskAtMinLotPct = 3.0;    // Skip the trade if the minimum lot would risk more than this (%)
 input double InpDailyLossPct       = 5.0;    // No new trades for the day after losing this % (closed + floating)
 input int    InpMaxTradesPerDay    = 4;      // Max new trades per UTC day
@@ -68,6 +74,35 @@ input int    InpMaxConsecLosses    = 3;      // No new trades for the day after 
 input double InpHardStopPct        = 30.0;   // HALT the EA if equity falls this % below the start balance
 input double InpStartBalance       = 0.0;    // Hard-stop start balance in ACCOUNT currency (cent: USC, $50 = 5000). 0 = balance at first run
 input bool   InpResetHalt          = false;  // Set true once to clear a HALT (start balance = current balance), then back to false
+
+input group "=== Sizing: rolling half-Kelly x signal depth (research core 'KT') ==="
+input bool   InpKellySizing        = true;   // Risk from the last closed trades (replaces InpRiskPct / ladder)
+input int    InpKellyWindow        = 60;     // ... number of closed trades used (max 200)
+input double InpKellyFrac          = 0.5;    // ... fraction of full Kelly (0.5 = half-Kelly)
+input double InpKellyVarFloor      = 0.5;    // ... floor on the R variance (keeps a lucky streak from blowing up risk)
+input double InpKellyMinPct        = 1.0;    // ... minimum base risk (%)
+input double InpKellyMaxPct        = 6.0;    // ... maximum base risk (%)
+input double InpKellyWarmPct       = 2.0;    // ... base risk until enough trades have closed (%)
+input int    InpKellyMinTrades     = 15;     // ... closed trades needed before Kelly is used
+input bool   InpDepthTiers         = true;   // Scale risk by how deep the RSI pullback was (shallow = bigger)
+input int    InpDepthBars          = 10;     // ... H1 bars (incl. the signal bar) for the RSI extreme
+input double InpDepthCutLo         = 1.826;  // ... depth <= this (shallow pullback): x InpDepthMultHi
+input double InpDepthCutHi         = 4.905;  // ... depth >  this (deep pullback): x InpDepthMultLo
+input double InpDepthMultHi        = 1.5;    // ... multiplier for shallow pullbacks
+input double InpDepthMultLo        = 0.5;    // ... multiplier for deep pullbacks
+
+input group "=== Trade management ==="
+input bool   InpWeekendHold        = true;   // Friday close: keep a winning position over the weekend (swap-free account!)
+input double InpWkMinR             = 1.0;    // ... only if open profit >= this x initial risk (R)
+input double InpWkLockR            = 0.5;    // ... and move the stop to entry + this x R
+input int    InpWkHours            = 96;     // ... close it this many hours after the Friday close (96 = Tuesday)
+input bool   InpWkLongOnly         = true;   // ... longs only (shorts did not pass the research)
+input bool   InpCapExtend          = false;  // AGGRESSIVE: at the max hold time keep a non-losing trend trade until Friday
+input double InpExtMinR            = 0.0;    // ... only if open profit >= this x R
+input double InpExtLockR           = 0.0;    // ... and move the stop to entry + this x R (0 = breakeven)
+input bool   InpReentry            = false;  // AGGRESSIVE: after a losing stop-out, re-enter on an RSI cross of InpReRsi
+input double InpReRsi              = 45.0;   // ... RSI level (long: up through it, short: down through 100 - it)
+input int    InpReWindowHours      = 48;     // ... within this many hours of the stop-out, same direction and trend
 
 input group "=== Execution ==="
 input long   InpMagic              = 20261021; // Magic number
@@ -104,6 +139,8 @@ string   g_lastSignal    = "";
 datetime g_lastCloseTry  = 0;
 datetime g_lastOrderTry  = 0;
 datetime g_lastExitM1    = 0;   // M1 bar of this EA's last exit (backtest: no new fill in the exit bar)
+datetime g_lastRScan     = 0;
+#define RH_CAP 200              // capacity of the closed-trade R ring buffer (global variables rh_0 .. rh_199)
 
 //+------------------------------------------------------------------+
 //| Time helpers                                                     |
@@ -387,17 +424,90 @@ int VolumeDigits(const double step)
    return digits;
   }
 
-// Lots for the given stop distance; 0 when the trade must be skipped
-double LotsForRisk(const bool isBuy, const double slDist, double &riskPctUsed)
+//+------------------------------------------------------------------+
+//| Rolling Kelly: R multiples of this EA's closed trades            |
+//+------------------------------------------------------------------+
+int RHistCount() { return (int)GvGet("rh_n", 0.0); }
+
+void RHistPush(const double r)
   {
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double peak   = MathMax(GvGet("peak", equity), equity);
+   int n = RHistCount();
+   GvSet(StringFormat("rh_%d", n % RH_CAP), r);
+   GvSetFlush("rh_n", n + 1);
+  }
+
+// base risk % from the last InpKellyWindow closed R: clip(frac x mean / max(var, floor), min, max)
+double KellyBasePct(int &used, double &kelly)
+  {
+   int n = RHistCount();
+   used = (int)MathMin(n, MathMin(InpKellyWindow, RH_CAP));
+   kelly = 0.0;
+   if(n < InpKellyMinTrades || used < 2)
+      return InpKellyWarmPct;
+   double x[];
+   ArrayResize(x, used);
+   double mean = 0.0;
+   for(int i = 0; i < used; i++)
+     {
+      x[i] = GvGet(StringFormat("rh_%d", (n - 1 - i) % RH_CAP), 0.0);
+      mean += x[i];
+     }
+   mean /= used;
+   double var = 0.0;
+   for(int i = 0; i < used; i++)
+      var += (x[i] - mean) * (x[i] - mean);
+   var /= (used - 1);
+   kelly = mean / MathMax(var, InpKellyVarFloor);
+   return MathMax(InpKellyMinPct, MathMin(InpKellyMaxPct, InpKellyFrac * kelly * 100.0));
+  }
+
+// risk multiplier from the pullback depth at the signal bar (long: 40 - lowest RSI, short: highest RSI - 60)
+double DepthMult(const bool isBuy, double &depth)
+  {
+   depth = 0.0;
+   if(!InpDepthTiers)
+      return 1.0;
+   double r[];
+   if(CopyBuffer(g_hRsi, 0, 1, InpDepthBars, r) != InpDepthBars)
+      return -1.0;   // data not ready: caller retries
+   double lo = r[0], hi = r[0];
+   for(int i = 1; i < InpDepthBars; i++)
+     {
+      lo = MathMin(lo, r[i]);
+      hi = MathMax(hi, r[i]);
+     }
+   depth = isBuy ? 40.0 - lo : hi - 60.0;
+   if(depth <= InpDepthCutLo)
+      return InpDepthMultHi;
+   if(depth > InpDepthCutHi)
+      return InpDepthMultLo;
+   return 1.0;
+  }
+
+// risk % before the drawdown brake (base x depth multiplier)
+double PlannedRiskPct(const double riskMult)
+  {
    double baseRisk = InpRiskPct;
-   if(InpRiskLadder && StartBalance() > 0.0)
+   if(InpKellySizing)
+     {
+      int used = 0;
+      double k = 0.0;
+      baseRisk = KellyBasePct(used, k);
+     }
+   else if(InpRiskLadder && StartBalance() > 0.0)
      {
       double growth = AccountInfoDouble(ACCOUNT_BALANCE) / StartBalance();
       baseRisk = (growth >= 4.0) ? InpRiskAt4x : (growth >= 2.0) ? InpRiskAt2x : InpRiskPct;
      }
+   return baseRisk * riskMult;
+  }
+
+// Lots for the given stop distance; 0 when the trade must be skipped
+double LotsForRisk(const bool isBuy, const double slDist, const double riskMult, double &riskPctUsed)
+  {
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double peak   = MathMax(GvGet("peak", equity), equity);
+   double baseRisk = PlannedRiskPct(riskMult);
    riskPctUsed   = (equity < peak * (1.0 - InpDDReducePct / 100.0)) ? MathMin(InpReducedRiskPct, baseRisk) : baseRisk;
    double riskMoney = equity * riskPctUsed / 100.0;
    double perLot    = LossPerLot(isBuy, slDist + InpRiskBufferUSD);
@@ -560,7 +670,8 @@ bool CanOpenNewTrade(string &why)
 //| Open a trade with the stop at an exact distance from the fill    |
 //+------------------------------------------------------------------+
 // returns true when a position was opened
-bool OpenTrade(const bool isBuy, const double slDist, const double trailDist, const string tag)
+bool OpenTrade(const bool isBuy, const double slDist, const double trailDist, const double riskMult, const bool reentry,
+               const string tag)
   {
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -579,7 +690,7 @@ bool OpenTrade(const bool isBuy, const double slDist, const double trailDist, co
       return false;
      }
    double riskPct = 0.0;
-   double lots = LotsForRisk(isBuy, slDist, riskPct);
+   double lots = LotsForRisk(isBuy, slDist, riskMult, riskPct);
    if(lots <= 0.0)
       return false;
    double entry = isBuy ? ask : bid;
@@ -598,6 +709,15 @@ bool OpenTrade(const bool isBuy, const double slDist, const double trailDist, co
    ulong openOrder = g_trade.ResultOrder();
    if(trailDist > 0.0 && openOrder > 0)
       GvSetFlush(StringFormat("trail_%I64d", (long)openOrder), trailDist);
+   if(openOrder > 0)
+     {
+      // initial stop distance, money at risk and kind, for R (Kelly), the weekend hold and the re-entry rule
+      GvSet(StringFormat("s0_%I64d", (long)openOrder), slDist);
+      GvSet(StringFormat("tg_%I64d", (long)openOrder), reentry ? 1.0 : 0.0);
+      GvSetFlush(StringFormat("r0_%I64d", (long)openOrder), lots * LossPerLot(isBuy, slDist));
+     }
+   GvSet("re_dir", 0.0);   // one re-entry per stop-out; a new trade replaces the last stop-out
+   GvSetFlush("re_until", 0.0);
    if(SelectMyPosition())
      {
       ulong ticket = (ulong)PositionGetInteger(POSITION_TICKET);
@@ -693,13 +813,26 @@ void CheckEntrySignal()
    double hi = 100.0 - InpRsiLevel;
    bool longSig  = (trend > 0) && (rsi[1] < lo) && (rsi[0] >= lo) && InpSides != SIDES_SHORT;
    bool shortSig = (trend < 0) && (rsi[1] > hi) && (rsi[0] <= hi) && InpSides != SIDES_LONG;
+   bool reentry  = false;
+   if(!longSig && !shortSig && InpReentry)
+     {
+      // within InpReWindowHours of a losing stop-out: an RSI cross of InpReRsi in the same direction
+      double reDir = GvGet("re_dir", 0.0);
+      if(reDir != 0.0 && TimeCurrent() <= (datetime)GvGet("re_until", 0.0))
+        {
+         longSig  = (reDir > 0) && (trend > 0) && (rsi[1] < InpReRsi) && (rsi[0] >= InpReRsi) && InpSides != SIDES_SHORT;
+         shortSig = (reDir < 0) && (trend < 0) && (rsi[1] > 100.0 - InpReRsi) && (rsi[0] <= 100.0 - InpReRsi)
+                    && InpSides != SIDES_LONG;
+         reentry  = longSig || shortSig;
+        }
+     }
    if(!longSig && !shortSig)
      {
       g_lastH1Bar = h1;
       return;
      }
-   g_lastSignal = StringFormat("%s %s RSI %.1f->%.1f", TimeToString(h1, TIME_DATE | TIME_MINUTES),
-                               longSig ? "LONG" : "SHORT", rsi[1], rsi[0]);
+   g_lastSignal = StringFormat("%s %s%s RSI %.1f->%.1f", TimeToString(h1, TIME_DATE | TIME_MINUTES),
+                               longSig ? "LONG" : "SHORT", reentry ? " (re-entry)" : "", rsi[1], rsi[0]);
    if(iTime(_Symbol, PERIOD_M1, 0) <= g_lastExitM1)
      {
       g_lastSkip  = "signal skipped: previous trade exited in this minute (backtest: busy)";
@@ -716,10 +849,15 @@ void CheckEntrySignal()
    double atr[];
    if(CopyBuffer(g_hAtr, 0, 1, 1, atr) != 1 || atr[0] <= 0.0)
       return;
+   double depth = 0.0;
+   double mult = DepthMult(longSig, depth);
+   if(mult <= 0.0)
+      return;   // RSI history not ready yet
    if(TimeCurrent() - g_lastOrderTry < 10)
       return;   // spread / order retry at most every 10 s within the entry window
    g_lastOrderTry = TimeCurrent();
-   if(OpenTrade(longSig, InpStopATR * atr[0], InpTrailATR * atr[0], longSig ? "pb-long" : "pb-short"))
+   string tag = StringFormat("%s%s d%.1f", reentry ? "re-" : "pb-", longSig ? "long" : "short", depth);
+   if(OpenTrade(longSig, InpStopATR * atr[0], InpTrailATR * atr[0], mult, reentry, tag))
       g_lastH1Bar = h1;
   }
 
@@ -751,7 +889,23 @@ double TrailDistance(const long posId, const datetime opened)
    return v;
   }
 
-// Time exits and the chandelier trailing stop (stop updates once per closed M1 bar, like the backtest)
+// initial stop distance of a position (R); rebuilt from the entry ATR if the stored value is missing
+double InitialStop(const long posId, const datetime opened)
+  {
+   string key = StringFormat("s0_%I64d", posId);
+   double v = GvGet(key, -1.0);
+   if(v > 0.0)
+      return v;
+   double a = EntryAtr(opened);
+   if(a <= 0.0)
+      return 0.0;
+   v = InpStopATR * a;
+   GvSet(key, v);
+   return v;
+  }
+
+// Time exits (Friday close / weekend hold, max hold / cap extension), the profit lock of a held position and the
+// chandelier trailing stop (stop updates once per closed M1 bar, like the backtest)
 void ManagePosition()
   {
    if(!SelectMyPosition())
@@ -761,24 +915,61 @@ void ManagePosition()
    datetime opened = (datetime)PositionGetInteger(POSITION_TIME);
    bool     isBuy  = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
    double   curSL  = PositionGetDouble(POSITION_SL);
+   double   entry  = PositionGetDouble(POSITION_PRICE_OPEN);
+   double   bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double   ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double   sl0    = InitialStop(posId, opened);
+   double   openR  = (sl0 > 0.0) ? (isBuy ? bid - entry : entry - ask) / sl0 : 0.0;   // open profit in R
+   string   wkKey  = StringFormat("wk_%I64d", posId);
+   string   exKey  = StringFormat("ex_%I64d", posId);
 
    datetime nowU = NowUtc();
    MqlDateTime u;
    TimeToStruct(nowU, u);
-   if(InpFridayClose && ((u.day_of_week == 5 && u.hour >= InpFridayCloseHourUTC) || u.day_of_week == 6 || u.day_of_week == 0))
+   double wkEnd = GvGet(wkKey, 0.0);   // > 0: held over the weekend until this UTC time
+   if(wkEnd > 0.0)
      {
-      CloseAllThrottled("Friday close");
-      return;
+      if((double)nowU >= wkEnd)
+        {
+         CloseAllThrottled("weekend hold ended");
+         return;
+        }
+     }
+   else if(InpFridayClose && ((u.day_of_week == 5 && u.hour >= InpFridayCloseHourUTC) || u.day_of_week == 6 || u.day_of_week == 0))
+     {
+      if(InpWeekendHold && u.day_of_week == 5 && sl0 > 0.0 && (isBuy || !InpWkLongOnly) && openR >= InpWkMinR)
+        {
+         wkEnd = (double)(DayStart(nowU) + InpFridayCloseHourUTC * 3600 + InpWkHours * 3600);
+         GvSetFlush(wkKey, wkEnd);
+         PrintFormat("Weekend hold: open profit %.2fR >= %.2fR, stop locked at +%.2fR, close at %s UTC", openR, InpWkMinR,
+                     InpWkLockR, TimeToString((datetime)wkEnd, TIME_DATE | TIME_MINUTES));
+        }
+      else
+        {
+         CloseAllThrottled("Friday close");
+         return;
+        }
      }
    if(SecondsToExtraFlat(nowU, 0) <= 0)
      {
       CloseAllThrottled("holiday early close");
       return;
      }
-   if(InpMaxHoldDays > 0 && TimeCurrent() - opened >= InpMaxHoldDays * 86400)
+   bool extended = GvGet(exKey, 0.0) > 0.5;
+   if(wkEnd <= 0.0 && !extended && InpMaxHoldDays > 0 && TimeCurrent() - opened >= InpMaxHoldDays * 86400)
      {
-      CloseAllThrottled("max hold time");
-      return;
+      if(InpCapExtend && sl0 > 0.0 && openR >= InpExtMinR && H4Trend() == (isBuy ? 1 : -1))
+        {
+         GvSetFlush(exKey, 1.0);
+         extended = true;
+         PrintFormat("Max hold reached with %.2fR in a live trend: kept until the Friday close, stop locked at +%.2fR",
+                     openR, InpExtLockR);
+        }
+      else
+        {
+         CloseAllThrottled("max hold time");
+         return;
+        }
      }
 
    datetime m1 = iTime(_Symbol, PERIOD_M1, 0);
@@ -786,32 +977,46 @@ void ManagePosition()
       return;
    g_lastM1Bar = m1;
 
-   double trail = TrailDistance(posId, opened);
-   if(trail <= 0.0)
-      return;
-   int shiftOpen = iBarShift(_Symbol, PERIOD_M1, opened, false);
-   if(shiftOpen < 1)
-      return;   // no closed M1 bar since the entry yet
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    long stopsLevel  = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
    long freezeLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
    double minGap = (double)(stopsLevel > freezeLevel ? stopsLevel : freezeLevel) * _Point;
    double tick = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    if(tick <= 0.0)
       tick = _Point;
-   double newSL;
+
+   // candidate stops: the chandelier trail and the lock of a held / extended position; the tightest wins
+   bool   have = false;
+   double newSL = 0.0;
+   double trail = TrailDistance(posId, opened);
+   int shiftOpen = iBarShift(_Symbol, PERIOD_M1, opened, false);
+   if(trail > 0.0 && shiftOpen >= 1)   // needs a closed M1 bar since the entry
+     {
+      int idx = isBuy ? iHighest(_Symbol, PERIOD_M1, MODE_HIGH, shiftOpen, 1)
+                      : iLowest(_Symbol, PERIOD_M1, MODE_LOW, shiftOpen, 1);
+      if(idx >= 0)
+        {
+         newSL = isBuy ? NormPrice(iHigh(_Symbol, PERIOD_M1, idx) - trail)
+                       : NormPrice(iLow(_Symbol, PERIOD_M1, idx) + (ask - bid) + trail);
+         have = true;
+        }
+     }
+   if(sl0 > 0.0 && (wkEnd > 0.0 || extended))
+     {
+      double lockR = MathMax(wkEnd > 0.0 ? InpWkLockR : -1e9, extended ? InpExtLockR : -1e9);
+      double lock = NormPrice(isBuy ? entry + lockR * sl0 : entry - lockR * sl0);
+      if(!have || (isBuy ? lock > newSL : lock < newSL))
+         newSL = lock;
+      have = true;
+     }
+   if(!have)
+      return;
    if(isBuy)
      {
-      int idx = iHighest(_Symbol, PERIOD_M1, MODE_HIGH, shiftOpen, 1);
-      if(idx < 0)
-         return;
-      newSL = NormPrice(iHigh(_Symbol, PERIOD_M1, idx) - trail);
       if(newSL <= curSL + tick)
          return;
       if(newSL >= bid)
         {
-         CloseAll("trailing stop crossed");
+         CloseAll("stop level crossed");
          return;
         }
       if(bid - newSL <= minGap)
@@ -819,22 +1024,18 @@ void ManagePosition()
      }
    else
      {
-      int idx = iLowest(_Symbol, PERIOD_M1, MODE_LOW, shiftOpen, 1);
-      if(idx < 0)
-         return;
-      newSL = NormPrice(iLow(_Symbol, PERIOD_M1, idx) + (ask - bid) + trail);
       if(curSL > 0.0 && newSL >= curSL - tick)
          return;
       if(newSL <= ask)
         {
-         CloseAll("trailing stop crossed");
+         CloseAll("stop level crossed");
          return;
         }
       if(newSL - ask <= minGap)
          return;
      }
    if(!g_trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP)))
-      PrintFormat("Trail modify failed: %u %s", g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription());
+      PrintFormat("Stop modify failed: %u %s", g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription());
   }
 
 //+------------------------------------------------------------------+
@@ -904,6 +1105,92 @@ void OnClosedDeal(const ulong deal)
    FileClose(h);
   }
 
+bool PositionIsOpen(const long posId)
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+      if(PositionGetTicket(i) > 0 && PositionGetInteger(POSITION_IDENTIFIER) == posId)
+         return true;
+   return false;
+  }
+
+// Every closed position that still has its entry record (r0_<id>): add its R to the Kelly history, arm the
+// re-entry after a losing stop-out of a normal entry, and drop the position's state. Runs after each deal and once a
+// minute, so a stop hit while the terminal was off is booked at the next start.
+void ProcessClosedPositions()
+  {
+   string pre = g_gvPrefix + "r0_";
+   long ids[];
+   for(int i = GlobalVariablesTotal() - 1; i >= 0; i--)
+     {
+      string name = GlobalVariableName(i);
+      if(StringFind(name, pre) != 0)
+         continue;
+      int n = ArraySize(ids);
+      ArrayResize(ids, n + 1);
+      ids[n] = StringToInteger(StringSubstr(name, StringLen(pre)));
+     }
+   for(int k = 0; k < ArraySize(ids); k++)
+     {
+      long id = ids[k];
+      if(id <= 0 || PositionIsOpen(id) || !HistorySelectByPosition(id))
+         continue;
+      double net = 0.0, inVol = 0.0, outVol = 0.0;
+      long reason = -1;
+      datetime exitT = 0;
+      bool isBuy = true;
+      for(int i = 0; i < HistoryDealsTotal(); i++)
+        {
+         ulong d = HistoryDealGetTicket(i);
+         if(d == 0)
+            continue;
+         long e = HistoryDealGetInteger(d, DEAL_ENTRY);
+         net += HistoryDealGetDouble(d, DEAL_PROFIT) + HistoryDealGetDouble(d, DEAL_SWAP)
+                + HistoryDealGetDouble(d, DEAL_COMMISSION);
+         if(e == DEAL_ENTRY_IN)
+           {
+            inVol += HistoryDealGetDouble(d, DEAL_VOLUME);
+            isBuy = (HistoryDealGetInteger(d, DEAL_TYPE) == DEAL_TYPE_BUY);
+           }
+         else if(e == DEAL_ENTRY_OUT || e == DEAL_ENTRY_OUT_BY)
+           {
+            outVol += HistoryDealGetDouble(d, DEAL_VOLUME);
+            datetime t = (datetime)HistoryDealGetInteger(d, DEAL_TIME);
+            if(t >= exitT)
+              {
+               exitT = t;
+               reason = HistoryDealGetInteger(d, DEAL_REASON);
+              }
+           }
+        }
+      if(inVol <= 0.0 || outVol < inVol - 1e-8)
+         continue;   // history not complete yet: retry later
+      double risk0 = GvGet(StringFormat("r0_%I64d", id), 0.0);
+      if(risk0 > 0.0)
+        {
+         double r = net / risk0;
+         RHistPush(r);
+         int used = 0;
+         double kelly = 0.0;
+         double nextBase = KellyBasePct(used, kelly);
+         PrintFormat("Position %I64d closed: %.2f = %.2fR. Kelly history %d trades, next base risk %.2f%%", id, net, r,
+                     RHistCount(), nextBase);
+        }
+      bool normal = GvGet(StringFormat("tg_%I64d", id), 0.0) < 0.5;
+      if(InpReentry && normal && reason == DEAL_REASON_SL && net < 0.0 && !SelectMyPosition())
+        {
+         GvSet("re_dir", isBuy ? 1.0 : -1.0);
+         GvSetFlush("re_until", (double)(exitT + InpReWindowHours * 3600));
+        }
+      GvDel(StringFormat("trail_%I64d", id));
+      GvDel(StringFormat("s0_%I64d", id));
+      GvDel(StringFormat("tg_%I64d", id));
+      GvDel(StringFormat("wk_%I64d", id));
+      GvDel(StringFormat("ex_%I64d", id));
+      GvDel(StringFormat("r0_%I64d", id));
+      GlobalVariablesFlush();
+     }
+  }
+
 void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
   {
    if(trans.type != TRADE_TRANSACTION_DEAL_ADD || trans.deal == 0)
@@ -918,6 +1205,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
       return;
      }
    OnClosedDeal(trans.deal);
+   ProcessClosedPositions();
   }
 
 //+------------------------------------------------------------------+
@@ -933,7 +1221,17 @@ void DrawPanel()
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
    double peak = MathMax(GvGet("peak", eq), eq);
    double start = StartBalance();
-   string s = StringFormat("GoldSwingCent v1.00  |  %s\n", can ? "waiting for a signal" : why);
+   string s = StringFormat("GoldSwingCent v1.10  |  %s\n", can ? "waiting for a signal" : why);
+   if(InpKellySizing)
+     {
+      int used = 0;
+      double k = 0.0;
+      double base = KellyBasePct(used, k);
+      s += StringFormat("Risk: Kelly base %.2f%% (%d closed trades%s) x depth %s\n", base, RHistCount(),
+                        RHistCount() < InpKellyMinTrades ? ", warm-up" : "", InpDepthTiers ? "0.5/1/1.5" : "off");
+     }
+   else
+      s += StringFormat("Risk: fixed %.2f%%\n", PlannedRiskPct(1.0));
    s += StringFormat("Equity %.2f  start %.2f  peak %.2f  DD %.1f%%\n", eq, start, peak, peak > 0 ? (1.0 - eq / peak) * 100.0 : 0.0);
    s += StringFormat("Hard stop at %.2f %s\n", start * (1.0 - InpHardStopPct / 100.0), IsHalted() ? "[HALTED]" : "");
    s += StringFormat("Today: P/L %.2f  trades %d/%d  loss streak %d/%d\n", ds.realized + FloatingPnL(), ds.trades,
@@ -977,9 +1275,32 @@ int OnInit()
      }
    if(InpRiskPct <= 0.0 || InpRiskPct > 5.0 || InpReducedRiskPct <= 0.0 || InpReducedRiskPct > InpRiskPct
       || InpRiskAt2x <= 0.0 || InpRiskAt2x > 5.0 || InpRiskAt4x <= 0.0 || InpRiskAt4x > 5.0
+      || InpDDReducePct <= 0.0 || InpDDReducePct > 100.0
       || InpStopATR <= 0.0 || InpHardStopPct <= 0.0 || InpHardStopPct >= 100.0)
      {
-      Print("Risk inputs out of range: 0 < reduced risk <= risk <= 5%, stop ATR > 0, 0 < hard stop < 100%.");
+      Print("Risk inputs out of range: 0 < reduced risk <= risk <= 5%, 0 < DD reduce <= 100%, stop ATR > 0, ",
+            "0 < hard stop < 100%.");
+      return INIT_PARAMETERS_INCORRECT;
+     }
+   if(InpKellySizing && (InpKellyWindow < 2 || InpKellyWindow > RH_CAP || InpKellyFrac <= 0.0 || InpKellyFrac > 1.0
+      || InpKellyVarFloor <= 0.0 || InpKellyMinPct <= 0.0 || InpKellyMinPct > InpKellyMaxPct || InpKellyMaxPct > 8.0
+      || InpKellyWarmPct < InpKellyMinPct || InpKellyWarmPct > InpKellyMaxPct || InpKellyMinTrades < 2))
+     {
+      Print("Kelly inputs out of range: window 2..200, 0 < fraction <= 1, variance floor > 0, ",
+            "0 < min <= warm-up <= max <= 8%, min trades >= 2.");
+      return INIT_PARAMETERS_INCORRECT;
+     }
+   if(InpDepthTiers && (InpDepthBars < 1 || InpDepthBars > 100 || InpDepthCutLo > InpDepthCutHi
+      || InpDepthMultLo <= 0.0 || InpDepthMultHi <= 0.0 || InpDepthMultHi > 2.0 || InpDepthMultLo > 2.0))
+     {
+      Print("Depth tier inputs out of range: 1..100 bars, low cut <= high cut, 0 < multipliers <= 2.");
+      return INIT_PARAMETERS_INCORRECT;
+     }
+   if(InpWkHours < 1 || InpWkHours > 120 || InpWkLockR < -1.0 || InpWkLockR >= InpWkMinR
+      || InpExtLockR < -1.0 || InpExtLockR > InpExtMinR || InpReRsi <= 0.0 || InpReRsi >= 100.0 || InpReWindowHours < 1)
+     {
+      Print("Trade management inputs out of range: weekend hold 1..120 h, lock below the min profit, ",
+            "extension lock <= its min profit, 0 < re-entry RSI < 100, re-entry window >= 1 h.");
       return INIT_PARAMETERS_INCORRECT;
      }
    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
@@ -1022,6 +1343,7 @@ int OnInit()
    g_trade.SetAsyncMode(false);
    if(!StrategyInit())
       return INIT_FAILED;
+   ProcessClosedPositions();   // book trades that closed while the EA was off
    PrintFormat("GoldSwingCent started on %s. Start balance %.2f, hard stop at %.2f, server offset %+.1fh",
                _Symbol, StartBalance(), StartBalance() * (1.0 - InpHardStopPct / 100.0), ServerOffsetSeconds() / 3600.0);
    return INIT_SUCCEEDED;
@@ -1039,6 +1361,11 @@ void OnTick()
       GvSetFlush("start", AccountInfoDouble(ACCOUNT_BALANCE));
    UpdatePeak();
    CheckHardStop();
+   if(TimeCurrent() - g_lastRScan >= 60)
+     {
+      g_lastRScan = TimeCurrent();
+      ProcessClosedPositions();
+     }
    if(SelectMyPosition())
       ManagePosition();
    if(!IsHalted())
