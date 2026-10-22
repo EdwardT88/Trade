@@ -3,6 +3,19 @@
 Ringkasan riset web (resmi broker + sumber pihak ketiga). Beberapa angka **nggak bisa diverifikasi live** dari sini,
 jadi yang ditandai (\*) wajib lu cek sendiri di MT5 sebelum deposit/jalanin EA.
 
+## Update v1.10: wajib swap-free
+
+EA v1.10 bisa nahan posisi BUY yang lagi profit lewat weekend (sampai Selasa). Kalau akunnya kena swap, biaya
+swap gold 4 malam (Rabu triple) makan sebagian profit itu. Jadi pilih akun **swap-free**:
+
+| Broker | Swap-free gold? | Catatan |
+|---|---|---|
+| **Exness Standard Cent** | Ya. Akun dari negara Islam (termasuk Indonesia) **otomatis swap-free**, XAUUSD masuk daftar. | Status bisa dicabut kalau dianggap "kebanyakan nahan posisi overnight". Cek di Personal Area → Trading conditions → Swap-Free. |
+| **HFM Cent** | Ya. Akun Cent swap-free, gold punya jatah **45 hari** bebas swap per posisi. | Lebih dari cukup (posisi EA maks ±7 hari). |
+
+Urutan pilihan sekarang: **1. Exness Standard Cent** (deposit lokal, swap-free otomatis, spread lebih tipis),
+**2. HFM Cent** (ada demo cent, swap-free juga). Kalau akun lu ternyata kena swap: `InpWeekendHold = false`.
+
 ## Pilihan gua
 
 ### 1. HFM — akun **Cent** (paling cocok)
@@ -54,6 +67,7 @@ Klik kanan `XAUUSDc` → **Specification**:
 7. **Margin call / stop-out** akun: lihat di properti akun.
 
 ## Sumber utama
+- Swap-free: [Exness Swap-free status](https://get.exness.help/hc/en-us/articles/4402341895570-Swap-free-status) · [HFM swap-free](https://www.hfm.com/int/en/funding/swap-free-trading) · [HFM XAUUSD (swap-free days)](https://www.hfm.com/int/en/trading-instruments/single-product?symbol=XAUUSD)
 - HFM: [Cent account](https://www.hfm.com/int/en/trading-accounts/cent-account) · [XAUUSD spec](https://www.hfm.com/int/en/trading-instruments/single-product?symbol=XAUUSD247) · [Advantages](https://www.hfm.com/int/en/about/advantages)
 - Exness: [Standard Cent](https://get.exness.help/hc/en-us/articles/17537782786588-Standard-Cent-account) · [Margin call & stop out](https://get.exness.help/hc/en-us/articles/360014693340-Margin-call-and-stop-out-levels-by-account-type) · [Commodities](https://get.exness.help/hc/en-us/articles/17854173039388-Commodities)
 - JustMarkets: [Standard accounts](https://justmarkets.com/trading/standard-accounts) · [Bank Indonesia lokal](https://justmarkets.com/company/news/22/local-indonesian-banks)
