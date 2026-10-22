@@ -39,6 +39,22 @@ Urutan pilihan sekarang: **1. Exness Standard Cent** (deposit lokal, swap-free o
 - Scalping diizinkan resmi; deposit BCA/Mandiri/BNI resmi ada.
 - Halaman mereka sendiri nggak konsisten soal Standard Cent di MT5, jadi cek dulu sebelum deposit.
 
+## Kenapa brokernya itu-itu aja
+
+Syarat EA ini: **MT5 + akun cent + gold bisa 0.01 lot = 0.01 oz**. SL EA = 2 × ATR(H4), sekitar $40–80 gerak gold.
+- Akun biasa (IC Markets, Pepperstone, XM, Octa, dll.): 0.01 lot = 1 oz → kena SL rugi $40–80 = **80–160% akun $50**.
+  Biar risk 2% butuh modal sekitar **$2.500–4.000**.
+- Akun cent: 0.01 lot = 0.01 oz → kena SL rugi 40–80 sen = **0,8–1,6%** dari 5.000 USC. Pas.
+
+Kandidat cent MT5 lain (belum dicek sedalam Exness/HFM, wajib cek Specification XAUUSD + swap sendiri):
+| Broker | Catatan |
+|---|---|
+| Vantage Cent | MT4/MT5, min deposit $50, swap-free cuma atas permintaan |
+| XS.com Cent | MT5, tanpa min deposit; swap-free gold cuma 5 hari grace |
+| JustMarkets Standard Cent | Sumber nggak konsisten soal MT5 |
+| InstaForex Cent, Headway Cent, OneRoyal Cent | Ada akun cent; spek gold & swap-free belum terverifikasi |
+| VT Markets Cent | Ada, tapi **nggak swap-free** → `InpWeekendHold = false` |
+
 ## Yang gua nggak saranin
 | Broker | Alasan |
 |---|---|
