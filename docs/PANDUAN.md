@@ -107,6 +107,7 @@ Artinya equity udah turun 30% dari saldo awal. EA nutup semua posisi dan berhent
 | Input | Default | Keterangan |
 |---|---|---|
 | `InpRiskPct` | 2.0 | Risk per trade (%). Minimal 1%, maksimal yang gua sarankan 3%. |
+| `InpRiskLadder` / `InpRiskAt2x` / `InpRiskAt4x` | off / 3.0 / 2.0 | Tangga risk: pakai `InpRiskPct` (misal 5) sampai saldo 2× saldo awal, lalu 3%, lalu 2% setelah 4×. Lebih agresif di awal (drawdown awal bisa 60–80%), makin kalem waktu akun udah gede. Lihat `scripts/money_management_check.py`. |
 | `InpSides` | Long and short | `Long only` = cuma BUY (lebih bagus di 2024–2025, tapi itu taruhan gold terus naik). |
 | `InpStopATR` / `InpTrailATR` | 2.0 / 3.0 | Jarak SL dan trailing (× ATR H4). Jangan diubah tanpa backtest ulang. |
 | `InpTrendEMA` / `InpRsiLevel` | 40 / 40 | Parameter strategi hasil riset. |

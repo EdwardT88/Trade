@@ -57,6 +57,9 @@ input string     InpExtraFlatUTC       = "2026.11.27 17:00;2026.12.24 17:00;2026
 input group "=== Risk (anti margin call) ==="
 input double InpRiskPct            = 2.0;    // Risk per trade (% of equity)
 input double InpReducedRiskPct     = 1.0;    // Risk while in drawdown (%)
+input bool   InpRiskLadder         = false;  // Risk ladder: InpRiskPct until the balance doubles, then step down
+input double InpRiskAt2x           = 3.0;    // ... risk once the balance is >= 2x the start balance (%)
+input double InpRiskAt4x           = 2.0;    // ... risk once the balance is >= 4x the start balance (%)
 input double InpDDReducePct        = 10.0;   // Drawdown from peak equity that switches to reduced risk (%)
 input double InpMaxRiskAtMinLotPct = 3.0;    // Skip the trade if the minimum lot would risk more than this (%)
 input double InpDailyLossPct       = 5.0;    // No new trades for the day after losing this % (closed + floating)
@@ -389,7 +392,13 @@ double LotsForRisk(const bool isBuy, const double slDist, double &riskPctUsed)
   {
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
    double peak   = MathMax(GvGet("peak", equity), equity);
-   riskPctUsed   = (equity < peak * (1.0 - InpDDReducePct / 100.0)) ? InpReducedRiskPct : InpRiskPct;
+   double baseRisk = InpRiskPct;
+   if(InpRiskLadder && StartBalance() > 0.0)
+     {
+      double growth = AccountInfoDouble(ACCOUNT_BALANCE) / StartBalance();
+      baseRisk = (growth >= 4.0) ? InpRiskAt4x : (growth >= 2.0) ? InpRiskAt2x : InpRiskPct;
+     }
+   riskPctUsed   = (equity < peak * (1.0 - InpDDReducePct / 100.0)) ? MathMin(InpReducedRiskPct, baseRisk) : baseRisk;
    double riskMoney = equity * riskPctUsed / 100.0;
    double perLot    = LossPerLot(isBuy, slDist + InpRiskBufferUSD);
    if(perLot <= 0.0 || equity <= 0.0)
@@ -967,6 +976,7 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
      }
    if(InpRiskPct <= 0.0 || InpRiskPct > 5.0 || InpReducedRiskPct <= 0.0 || InpReducedRiskPct > InpRiskPct
+      || InpRiskAt2x <= 0.0 || InpRiskAt2x > 5.0 || InpRiskAt4x <= 0.0 || InpRiskAt4x > 5.0
       || InpStopATR <= 0.0 || InpHardStopPct <= 0.0 || InpHardStopPct >= 100.0)
      {
       Print("Risk inputs out of range: 0 < reduced risk <= risk <= 5%, stop ATR > 0, 0 < hard stop < 100%.");
