@@ -14,3 +14,21 @@ Rules:
    (account growth at the same risk), with no hard stop and max drawdown ≤ 40%.
 3. Risk per trade is capped at 3% (sizing study: 5%+ hit the −30% hard stop in 2013).
 Evaluation: `python scripts/gold_full_eval.py <module> --risk 2` (and 3).
+
+---
+
+## Results (validation run once per candidate)
+
+$50 account, final equity per period. Validation sum = 2020–21 + 2022–25 + 2026.
+
+| Candidate | Dev 2013–19 (2%) | 2020–21 | 2022–25 | 2026 | Val sum 2% | Val sum 3% | Verdict |
+|---|---|---|---|---|---|---|---|
+| **Baseline (EA)** | $56.41 | $41.95 | **$122.45** | $46.70 | **$211.10** | **$240.80** | kept |
+| gold_regime (skip low D1 vol) | $79.24 | $43.71 | $78.50 | $46.70 | $168.91 | $186.12 | rejected |
+| gold_exits (trail 2.5 ATR + 1 pyramid add at +1R) | $71.23 | $42.97 | $98.86 | $42.73 | $184.56 | $197.76 | rejected |
+| gold_combo (pullback + breakout, vol sizing, shared risk cap) | $71.47 | $49.50 | $70.91 | $49.01 | $169.42 | $162.20 | rejected |
+
+Every tweak improved the period it was tuned on and lost out of sample, mostly in 2022–2025 where the
+baseline's trades were best. Directional regime filters (SMA/EMA 100–250, momentum, W1 trend, long-only in
+up-regimes) did not help even on dev. Adding systems at full risk raised dev drawdowns to 35–51%.
+**Decision: no tweak is deployed; the EA stays as is.** Research logs: results/gold_*_dev.md.
