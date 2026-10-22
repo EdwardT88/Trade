@@ -20,7 +20,7 @@ from backtest.markets import FX, cost_model, keep_entries_from, load, r_stats, r
 from strategies import load as load_strategy  # noqa: E402
 
 
-def evaluate(mod, pairs, start, end, params, stress=1.0, swap=3.0):
+def evaluate(mod, pairs, start, end, params, stress=1.0, swap=None):
     per, all_trades = {}, []
     for sym in pairs:
         bars = load(sym, start, end)
@@ -41,7 +41,7 @@ def main():
     ap.add_argument("--end", required=True)
     ap.add_argument("--params", default="{}")
     ap.add_argument("--stress", type=float, default=1.0)
-    ap.add_argument("--swap", type=float, default=3.0)
+    ap.add_argument("--swap", type=float, default=None, help="swap %%/yr (default: FX 3, metals 5; 0 = swap-free)")
     ap.add_argument("--trades-csv", default=None)
     a = ap.parse_args()
     pairs = FX if a.pairs == "all" else FX + ["XAUUSD"] if a.pairs == "all+gold" else a.pairs.split(",")

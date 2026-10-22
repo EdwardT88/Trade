@@ -33,14 +33,16 @@ def pip(sym: str) -> float:
     return 0.01 if sym.endswith("JPY") else 0.0001
 
 
-def cost_model(sym: str, stress: float = 1.0, swap_annual_pct: float = 3.0) -> CostModel:
-    """Cent-account costs in price units. stress multiplies spread and slippage (e.g. 1.5)."""
-    if sym == "XAUUSD":
-        return CostModel(spread_fixed=0.25 * stress, spread_bps=0.8 * stress, slippage_stop=0.05 * stress,
-                         swap_annual_pct=max(swap_annual_pct, 5.0))
-    if sym == "XAGUSD":
-        return CostModel(spread_fixed=0.03 * stress, spread_bps=0.0, slippage_stop=0.005 * stress,
-                         swap_annual_pct=max(swap_annual_pct, 5.0))
+def cost_model(sym: str, stress: float = 1.0, swap_annual_pct: float | None = None) -> CostModel:
+    """Cent-account costs in price units. stress multiplies spread and slippage (e.g. 1.5).
+    swap_annual_pct=None uses the default (metals 5%/yr, FX 3%/yr); 0 = swap-free account."""
+    if sym in ("XAUUSD", "XAGUSD"):
+        swap = 5.0 if swap_annual_pct is None else swap_annual_pct
+        if sym == "XAUUSD":
+            return CostModel(spread_fixed=0.25 * stress, spread_bps=0.8 * stress, slippage_stop=0.05 * stress,
+                             swap_annual_pct=swap)
+        return CostModel(spread_fixed=0.03 * stress, spread_bps=0.0, slippage_stop=0.005 * stress, swap_annual_pct=swap)
+    swap_annual_pct = 3.0 if swap_annual_pct is None else swap_annual_pct
     p = pip(sym)
     return CostModel(spread_fixed=SPREAD_PIPS[sym] * p * stress, spread_bps=0.0, slippage_stop=0.2 * p * stress,
                      swap_annual_pct=swap_annual_pct)
